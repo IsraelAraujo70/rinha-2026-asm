@@ -438,7 +438,7 @@ parse_score_count_from_json:
     call vectorize_json_partial
     cmp qword [rel index_loaded], 1
     jne .heuristic
-    call knn_count_first_cluster
+    call knn_count_first_clusters
     jmp .done
 
 .heuristic:
@@ -579,18 +579,19 @@ heuristic_count_from_vector:
     ret
 
 ; ============================================================
-; knn_count_first_cluster — scan the first IVF cluster with scalar i16 L2.
+; knn_count_first_clusters — scan the first up-to-8 IVF clusters.
 ;   Out: rax = number of fraud labels among the 5 nearest records in cluster 0
 ;
-; This is Wave 5's first real index-backed KNN slice. It intentionally scans
-; only cluster 0; Wave 6 adds centroid selection and multi-cluster probing.
+; This is Wave 6's multi-cluster scan slice. It still uses a fixed probe list
+; (clusters 0..7) rather than centroid-selected probes; Wave 7 sorts centroids.
 ; ============================================================
-knn_count_first_cluster:
+knn_count_first_clusters:
     push rbx
     push r12
     push r13
     push r14
     push r15
+    push rbp
 
     ; Initialize best distances to UINT64_MAX and labels to 0.
     lea rdi, [rel best_dist]
@@ -612,32 +613,54 @@ knn_count_first_cluster:
     mov rbx, [rel cluster_offsets_ptr]
     test rbx, rbx
     jz .fallback_zero
-    mov r12, [rbx]            ; start offset
-    mov r13, [rbx + 8]        ; end offset
+
+    xor ebp, ebp              ; cluster_id
+    mov r15, [rel index_clusters]
+    cmp r15, 8
+    jbe .probe_limit_ok
+    mov r15d, 8
+.probe_limit_ok:
+    test r15, r15
+    jz .fallback_zero
+
+.cluster_loop:
+    cmp rbp, r15
+    jae .score
+
+    mov r12, [rbx + rbp * 8]      ; start offset
+    mov r13, [rbx + rbp * 8 + 8]  ; end offset
     cmp r13, r12
-    jbe .fallback_zero
+    jbe .next_cluster
 
     mov r14, [rel records_ptr]
     mov rax, r12
-    shl rax, 5                ; * IVF_RECORD_LEN (32)
-    add r14, rax              ; current record ptr
+    shl rax, 5                    ; * IVF_RECORD_LEN (32)
+    add r14, rax                  ; current record ptr
 
-    mov r15, r13
-    sub r15, r12              ; records remaining
+    mov r10, r13
+    sub r10, r12                  ; records remaining
 
-.scan:
-    test r15, r15
-    jz .score
+.record_loop:
+    test r10, r10
+    jz .next_cluster
 
     mov rdi, r14
+    push r10
     call squared_distance_record_scalar
+    pop r10
     movzx esi, byte [r14 + 28]
     mov rdi, rax
+    push r10
     call insert_best_u64_asm
+    pop r10
 
     add r14, IVF_RECORD_LEN
-    dec r15
-    jmp .scan
+    dec r10
+    jmp .record_loop
+
+.next_cluster:
+    inc rbp
+    jmp .cluster_loop
 
 .score:
     xor eax, eax
@@ -656,6 +679,7 @@ knn_count_first_cluster:
     xor eax, eax
 
 .done:
+    pop rbp
     pop r15
     pop r14
     pop r13
