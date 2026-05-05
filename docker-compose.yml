@@ -19,7 +19,7 @@ services:
           memory: "50MB"
 
   api1:
-    image: ttl.sh/rinha-2026-asm-israelaraujo70-1777986132:24h
+    image: ghcr.io/israelaraujo70/rinha-2026-asm:e353f41
     platform: linux/amd64
 
     environment:
@@ -35,7 +35,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: ttl.sh/rinha-2026-asm-israelaraujo70-1777986132:24h
+    image: ghcr.io/israelaraujo70/rinha-2026-asm:e353f41
     platform: linux/amd64
 
     environment:
