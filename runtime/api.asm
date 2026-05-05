@@ -44,6 +44,8 @@ fs_path:       db '/fraud-score '
 fs_path_len    equ $ - fs_path
 cl_pattern:    db "content-length:"
 cl_pattern_len equ $ - cl_pattern
+tx_count_key:  db '"tx_count_24h"'
+tx_count_key_len equ $ - tx_count_key
 
 section .text
 
@@ -176,6 +178,10 @@ serve_one_request:
 
 .have_full_request:
     lea rdi, [rel recv_buf]
+    lea rsi, [rel recv_buf]
+    add rsi, rbx              ; rsi = body ptr
+    mov rdx, r14
+    sub rdx, rbx              ; rdx = buffered body length
     call route_request        ; rax = response ptr, rdx = response length
 
     mov rsi, rax
@@ -201,9 +207,16 @@ serve_one_request:
 ; ============================================================
 ; route_request — inspect method + path, return (response_ptr, length).
 ;   In : rdi = pointer to request line (recv_buf)
+;        rsi = body pointer
+;        rdx = body length
 ;   Out: rax = response ptr, rdx = response length
 ; ============================================================
 route_request:
+    push rbx
+    push r12
+    mov rbx, rsi              ; preserve body ptr across path checks
+    mov r12, rdx              ; preserve body len across path checks
+
     mov eax, [rdi]
     cmp eax, 0x20544547       ; 'GET ' little-endian
     je .is_get
@@ -219,9 +232,14 @@ route_request:
     call bytes_eq
     test rax, rax
     jnz .approve_fallback
-    lea rax, [rel resp0]
-    mov edx, resp0_end - resp0
-    ret
+    mov rdi, rbx
+    mov rsi, r12
+    call parse_score_count_from_json
+    shl rax, 4                ; resp_table stores 16-byte [ptr,len] slots
+    lea r8, [rel resp_table]
+    mov rdx, [r8 + rax + 8]
+    mov rax, [r8 + rax]
+    jmp .done
 
 .is_get:
     lea rsi, [rdi + 4]
@@ -232,11 +250,14 @@ route_request:
     jnz .approve_fallback
     lea rax, [rel ready_resp]
     mov edx, READY_RESP_LEN
-    ret
+    jmp .done
 
 .approve_fallback:
     lea rax, [rel resp0]
     mov edx, resp0_end - resp0
+.done:
+    pop r12
+    pop rbx
     ret
 
 ; ============================================================
@@ -363,4 +384,171 @@ parse_content_length:
 
 .not_found:
     xor rax, rax
+    ret
+
+; ============================================================
+; parse_score_count_from_json — Wave 2 observable JSON parser.
+;   In : rdi = body pointer, rsi = body length
+;   Out: rax = count in 0..5
+;
+; This is deliberately a narrow, testable parser slice: it extracts the real
+; `customer.tx_count_24h` field and maps it to one of the six response slots.
+; Wave 3 expands this into the full 14-dimensional vectorization contract.
+; ============================================================
+parse_score_count_from_json:
+    push rbx
+    push r12
+
+    mov rbx, rdi              ; body base
+    mov r12, rsi              ; body length
+
+    lea rdx, [rel tx_count_key]
+    mov rcx, tx_count_key_len
+    call find_bytes
+    test rax, rax
+    js .fallback_zero
+
+    ; rax = offset of key. Move to byte after key and scan for ':'.
+    add rax, tx_count_key_len
+    mov rdi, rbx
+    add rdi, rax              ; current ptr
+    mov rsi, r12
+    sub rsi, rax              ; remaining len
+    call parse_u64_after_colon
+
+    ; Clamp parsed integer into response count range 0..5.
+    cmp rax, 5
+    jbe .done
+    mov eax, 5
+    jmp .done
+
+.fallback_zero:
+    xor eax, eax
+
+.done:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; find_bytes — naive exact substring search.
+;   In : rdi = haystack ptr, rsi = haystack len, rdx = needle ptr, rcx = needle len
+;   Out: rax = offset or -1
+; ============================================================
+find_bytes:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rbx, rdi              ; haystack
+    mov r12, rsi              ; hay len
+    mov r13, rdx              ; needle
+    mov r14, rcx              ; needle len
+
+    test r14, r14
+    jz .found_zero
+    cmp r12, r14
+    jb .not_found
+
+    mov r15, r12
+    sub r15, r14              ; max start offset
+    xor r8, r8                ; current offset
+
+.outer:
+    cmp r8, r15
+    ja .not_found
+    xor r9, r9                ; needle index
+
+.inner:
+    cmp r9, r14
+    jae .found
+    lea r10, [rbx + r8]
+    mov al, [r10 + r9]
+    cmp al, [r13 + r9]
+    jne .next
+    inc r9
+    jmp .inner
+
+.next:
+    inc r8
+    jmp .outer
+
+.found_zero:
+    xor eax, eax
+    jmp .return
+
+.found:
+    mov rax, r8
+    jmp .return
+
+.not_found:
+    mov rax, -1
+
+.return:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; parse_u64_after_colon — scan a short JSON suffix for ':' and parse uint.
+;   In : rdi = ptr after key, rsi = remaining length
+;   Out: rax = parsed integer, or 0 if missing/malformed
+; ============================================================
+parse_u64_after_colon:
+    xor r8, r8
+
+.find_colon:
+    cmp r8, rsi
+    jae .zero
+    cmp byte [rdi + r8], ':'
+    je .after_colon
+    inc r8
+    jmp .find_colon
+
+.after_colon:
+    inc r8
+
+.skip_ws:
+    cmp r8, rsi
+    jae .zero
+    mov al, [rdi + r8]
+    cmp al, ' '
+    je .skip_one
+    cmp al, 9
+    je .skip_one
+    cmp al, 10
+    je .skip_one
+    cmp al, 13
+    je .skip_one
+    jmp .parse
+
+.skip_one:
+    inc r8
+    jmp .skip_ws
+
+.parse:
+    xor rax, rax
+
+.digit:
+    cmp r8, rsi
+    jae .done
+    movzx ecx, byte [rdi + r8]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .done
+    imul rax, rax, 10
+    add rax, rcx
+    inc r8
+    jmp .digit
+
+.done:
+    ret
+
+.zero:
+    xor eax, eax
     ret
