@@ -17,7 +17,27 @@
 
 %include "syscalls.inc"
 
+%ifndef BENCH_BUILD
 global _start
+%endif
+
+; Symbols exported for bench harness (runtime/bench.asm).
+global load_socket_path_from_env
+global load_index_optional
+global select_top8_clusters
+global select_top8_clusters_legacy
+global centroid_distance_scalar
+global scan_cluster_soa_avx2
+global scan_cluster_soa_scalar
+global query_i16
+global cluster_best_id
+global cluster_best_dist
+global best_dist
+global best_label
+global best_id
+global index_loaded
+global index_clusters
+global index_format
 
 section .data
 sockaddr_in:
@@ -32,6 +52,7 @@ one_int: dd 1
 section .data
 socket_path_ptr: dq 0
 socket_path_len: dq 0
+index_path_override: dq 0     ; if non-zero, used instead of default '/index/data.bin'
 index_loaded:      dq 0
 index_format:      dq 0       ; 1=RINHA26 AoS32, 2=IVF6 AoS28+labels
 index_base:        dq 0
@@ -63,6 +84,21 @@ best_id: resd 5
 cluster_best_dist: resq 8
 cluster_best_id: resq 8
 cluster_visited: resb 4096
+; Pre-baked centroids in i16 SoA layout for fast L2 distance during selection.
+; Layout: cents_i16_soa[d * 256 + c] = cvttss2si(centroid[c].lane[d] * 10000).
+; Capped at K=256; bake fills only the first index_clusters slots per dim,
+; so unused tail lanes stay zero (.bss is zero-initialized at load).
+; 32-byte aligned so AVX2 vpmovsxwd loads from a clean line per block.
+alignb 32
+cents_i16_soa: resw 14 * 256
+; AVX2 spill buffer: 8 × i64 distances per cluster block, sent into
+; insert_best_cluster_asm one lane at a time.
+alignb 32
+acc_spill: resb 64
+; PR-A3 XMM tail spill: 4 × i64 distances for one batch of 4 records
+; (records past the last full 8-block of a SIVF cluster scan).
+alignb 32
+tail_acc_4: resb 32
 dist_lanes: resd 8
 dim_ptrs: resq 14
 soa_tmp_lo: resq 4
@@ -98,6 +134,8 @@ ivf_nprobe_prefix: db 'IVF_NPROBE='
 ivf_nprobe_prefix_len equ $ - ivf_nprobe_prefix
 ivf_repair_limit_prefix: db 'IVF_REPAIR_LIMIT='
 ivf_repair_limit_prefix_len equ $ - ivf_repair_limit_prefix
+index_path_prefix: db 'INDEX_PATH='
+index_path_prefix_len equ $ - index_path_prefix
 tx_count_key:  db '"tx_count_24h"'
 tx_count_key_len equ $ - tx_count_key
 amount_key:    db '"amount"'
@@ -155,7 +193,9 @@ section .text
 
 ; ============================================================
 ; _start — setup listener, then accept-serve loop forever.
+; (Built only for the main API binary; bench harness provides its own _start.)
 ; ============================================================
+%ifndef BENCH_BUILD
 _start:
     mov rdi, rsp
     call load_socket_path_from_env
@@ -290,6 +330,7 @@ _start:
     mov eax, SYS_exit_group
     mov edi, 1
     syscall
+%endif ; BENCH_BUILD
 
 ; ============================================================
 ; load_socket_path_from_env — parse initial stack envp for runtime knobs.
@@ -330,6 +371,13 @@ load_socket_path_from_env:
     test rax, rax
     jnz .ivf_repair_limit
 
+    mov rdi, r12
+    lea rsi, [rel index_path_prefix]
+    mov rcx, index_path_prefix_len
+    call mem_prefix_eq
+    test rax, rax
+    jnz .index_path
+
     jmp .next
 
 .socket_path:
@@ -362,6 +410,13 @@ load_socket_path_from_env:
     mov eax, 8
 .repair_ok:
     mov [rel repair_limit], rax
+    jmp .next
+
+.index_path:
+    lea r13, [r12 + index_path_prefix_len]
+    cmp byte [r13], 0
+    je .next
+    mov [rel index_path_override], r13
     jmp .next
 
 .next:
@@ -1655,6 +1710,27 @@ scan_cluster_id:
     vpaddq ymm6, ymm6, ymm4
 %endmacro
 
+; PR-A3: 4-record XMM batch for the SIVF tail (records past the last
+; full block of 8). Mirrors ACC_SOA_DIM8 at half width (4 i32 lanes per
+; xmm). Accumulators xmm5/xmm6 each hold 2 × i64. No early-exit since
+; the four records are processed in lockstep; insert_best_u64_asm still
+; gates per-record write on best_dist[4].
+%macro ACC_SOA_DIM4 1
+    movsx eax, word [rel query_i16 + %1 * 2]
+    vmovd xmm2, eax
+    vpbroadcastd xmm2, xmm2
+    mov rax, [rel dim_ptrs + %1 * 8]
+    vmovq xmm0, [rax + r11 * 2]            ; 4 i16 = 8 bytes
+    vpmovsxwd xmm1, xmm0                   ; 4 × i32
+    vpsubd xmm1, xmm1, xmm2                ; diff (i32)
+    vpmulld xmm1, xmm1, xmm1               ; sq (low 32 of signed mul)
+    vpmovsxdq xmm3, xmm1                   ; low 2 i32 → 2 i64
+    vpaddq xmm5, xmm5, xmm3
+    vpshufd xmm3, xmm1, 0xee               ; high 64 bits → low position
+    vpmovsxdq xmm3, xmm3                   ; high 2 i32 → 2 i64
+    vpaddq xmm6, xmm6, xmm3
+%endmacro
+
 ; ============================================================
 ; scan_cluster_soa_avx2 — SIVF scan, eight records per vector chunk.
 ;   In : rdi = cluster id
@@ -1750,8 +1826,62 @@ scan_cluster_soa_avx2:
 .tail:
     cmp r11, r13
     jae .done
-    ; Tail uses the same early-exit scalar logic for the final 0..7 records.
-.tail_loop:
+
+    ; PR-A3: if ≥ 4 records remain, process the first 4 as one XMM batch
+    ; (no early-exit, all 14 dims). Then fall through to the scalar tail
+    ; loop for the residual 0..3 records, which keeps its early-exit.
+    mov rax, r13
+    sub rax, r11
+    cmp rax, 4
+    jl .tail_scalar_loop
+
+    vpxor xmm5, xmm5, xmm5
+    vpxor xmm6, xmm6, xmm6
+
+    ACC_SOA_DIM4 5
+    ACC_SOA_DIM4 6
+    ACC_SOA_DIM4 2
+    ACC_SOA_DIM4 0
+    ACC_SOA_DIM4 7
+    ACC_SOA_DIM4 8
+    ACC_SOA_DIM4 11
+    ACC_SOA_DIM4 12
+    ACC_SOA_DIM4 9
+    ACC_SOA_DIM4 10
+    ACC_SOA_DIM4 1
+    ACC_SOA_DIM4 13
+    ACC_SOA_DIM4 3
+    ACC_SOA_DIM4 4
+
+    vmovdqa [rel tail_acc_4],      xmm5
+    vmovdqa [rel tail_acc_4 + 16], xmm6
+
+    xor ecx, ecx
+.batch_insert:
+    cmp ecx, 4
+    jae .batch_done
+    lea r9, [rel tail_acc_4]
+    mov rdi, [r9 + rcx * 8]
+    lea r8, [r11 + rcx]
+    mov rax, [rel labels_ptr]
+    movzx esi, byte [rax + r8]
+    mov rax, [rel ids_ptr]
+    mov edx, [rax + r8 * 4]
+    push rcx
+    push r11
+    push r13
+    call insert_best_u64_asm
+    pop r13
+    pop r11
+    pop rcx
+    inc ecx
+    jmp .batch_insert
+
+.batch_done:
+    add r11, 4
+
+    ; Scalar tail (residual 0..3 records) keeps the early-exit semantics.
+.tail_scalar_loop:
     cmp r11, r13
     jae .done
     xor r8, r8
@@ -1783,7 +1913,7 @@ scan_cluster_soa_avx2:
 
 .skip_record:
     inc r11
-    jmp .tail_loop
+    jmp .tail_scalar_loop
 
 .done:
     vzeroupper
@@ -1857,10 +1987,143 @@ scan_cluster_soa_scalar:
     ret
 
 ; ============================================================
-; select_top8_clusters — choose closest centroid ids into cluster_best_id.
-;   Uses scalar SSE to convert centroid f32 lanes to i16 scale on the fly.
+; select_top8_clusters — AVX2 top-8 cluster selection.
+;
+;   Outer loop: 8 centroids per iteration; inner loop: 14 dims.
+;   Reads from cents_i16_soa (pre-baked in PR-A1, 32-byte aligned, layout
+;   cents[d * 256 + c]). Tail (clusters past the last full block of 8) falls
+;   back to scalar i16-SoA distance to handle K not divisible by 8.
+;
+;   Math is bit-for-bit equivalent to select_top8_clusters_legacy:
+;     diff = (i32)query[d] - (i32)centroid[d]
+;     sq   = diff * diff      (low 32 bits of signed mul, like `imul esi,esi`)
+;     acc += (i64)sq          (sign-extend, then add to per-cluster u64)
+;
+;   Verified with bench's diff mode (10K random queries → 0 differences).
 ; ============================================================
 select_top8_clusters:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Init top-8 buffers: dists = -1 (max u64), ids = 0.
+    vpcmpeqq ymm0, ymm0, ymm0
+    vmovdqu [rel cluster_best_dist], ymm0
+    vmovdqu [rel cluster_best_dist + 32], ymm0
+    vpxor xmm0, xmm0, xmm0
+    vmovdqu [rel cluster_best_id], ymm0
+    vmovdqu [rel cluster_best_id + 32], ymm0
+
+    mov r12, [rel index_clusters]
+    test r12, r12
+    jz .done
+
+    mov r14, r12
+    shr r14, 3                          ; number of full 8-cluster blocks
+    xor r13, r13                        ; current block index
+
+    lea r10, [rel query_i16]            ; bases hoisted out of inner loop
+    lea r11, [rel cents_i16_soa]        ; (RIP-relative + index reg is illegal)
+
+    test r14, r14
+    jz .tail
+
+.block_loop:
+    cmp r13, r14
+    jae .tail
+
+    vpxor ymm6, ymm6, ymm6              ; acc_lo (cluster lanes 0-3, i64)
+    vpxor ymm7, ymm7, ymm7              ; acc_hi (cluster lanes 4-7, i64)
+
+    mov r15, r13
+    shl r15, 4                          ; byte offset into each dim row: c_block * 16
+
+    xor ecx, ecx                        ; dim d
+.dim_loop:
+    cmp ecx, DIMS
+    jae .dim_done
+
+    movsx eax, word [r10 + rcx * 2]
+    vmovd xmm0, eax
+    vpbroadcastd ymm0, xmm0             ; query[d] in 8 i32 lanes
+
+    mov rax, rcx
+    shl rax, 9                          ; d * 512 (bytes per dim row)
+    add rax, r15                        ; + c_block * 16
+    vpmovsxwd ymm1, [r11 + rax]         ; 8 i16 → 8 i32 centroid lanes
+
+    vpsubd  ymm2, ymm0, ymm1            ; diff (8 × i32)
+    vpmulld ymm2, ymm2, ymm2            ; sq   (8 × i32, low 32 of signed mul)
+
+    ; Accumulate low 4 lanes into ymm6 (i64).
+    vextracti128 xmm3, ymm2, 0
+    vpmovsxdq    ymm3, xmm3
+    vpaddq       ymm6, ymm6, ymm3
+
+    ; Accumulate high 4 lanes into ymm7 (i64).
+    vextracti128 xmm3, ymm2, 1
+    vpmovsxdq    ymm3, xmm3
+    vpaddq       ymm7, ymm7, ymm3
+
+    inc ecx
+    jmp .dim_loop
+
+.dim_done:
+    vmovdqa [rel acc_spill],      ymm6
+    vmovdqa [rel acc_spill + 32], ymm7
+
+    mov rbx, r13
+    shl rbx, 3                          ; first cluster id of block
+    lea r9, [rel acc_spill]
+    xor ecx, ecx
+.insert_loop:
+    cmp ecx, 8
+    jae .next_block
+    mov rdi, [r9 + rcx * 8]
+    lea rsi, [rbx + rcx]
+    push rcx
+    push r9
+    call insert_best_cluster_asm
+    pop r9
+    pop rcx
+    inc ecx
+    jmp .insert_loop
+
+.next_block:
+    inc r13
+    jmp .block_loop
+
+.tail:
+    mov rbx, r13
+    shl rbx, 3                          ; first tail cluster id
+.tail_loop:
+    cmp rbx, r12
+    jae .done
+    mov rdi, rbx
+    call centroid_distance_i16_soa
+    mov rdi, rax
+    mov rsi, rbx
+    call insert_best_cluster_asm
+    inc rbx
+    jmp .tail_loop
+
+.done:
+    vzeroupper
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; select_top8_clusters_legacy — pre-PR-A1 baseline, calls scalar distance.
+;   Kept identical to give the bench's diff mode a stable ground-truth.
+;   Not used in production after PR-A1.
+; ============================================================
+select_top8_clusters_legacy:
     push rbx
     push r12
     push r13
@@ -1884,15 +2147,15 @@ select_top8_clusters:
     loop .init_id
 
     mov r12, [rel index_clusters]
-    xor r13, r13              ; cluster id
+    xor r13, r13
 
 .loop:
     cmp r13, r12
     jae .done
     mov rdi, r13
     call centroid_distance_scalar
-    mov rdi, rax              ; distance
-    mov rsi, r13              ; cluster id
+    mov rdi, rax
+    mov rsi, r13
     call insert_best_cluster_asm
     inc r13
     jmp .loop
@@ -1941,6 +2204,109 @@ centroid_distance_scalar:
 
 .done:
     pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; bake_centroids_i16_soa — convert centroids from f32 AoS to i16 SoA.
+;   Reads:  centroids_ptr (f32 AoS, [c*14 + d]), index_clusters
+;   Writes: cents_i16_soa[d * 256 + c] (i16, byte stride 2)
+;
+;   Uses cvttss2si truncation, exactly matching centroid_distance_scalar so
+;   the new fast path stays bit-for-bit equivalent. Caps at K=256.
+;   Called once at startup from each load path before index_loaded=1.
+; ============================================================
+bake_centroids_i16_soa:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov rbx, [rel centroids_ptr]
+    test rbx, rbx
+    jz .done                             ; no centroids loaded; nothing to bake
+    mov r12, [rel index_clusters]
+    test r12, r12
+    jz .done
+    cmp r12, 256
+    jbe .ok_size
+    mov r12, 256                         ; should never trigger for the index we ship
+.ok_size:
+
+    movss xmm1, dword [rel f32_10000]
+
+    xor r13, r13                         ; cluster id c
+.cluster_loop:
+    cmp r13, r12
+    jae .done
+
+    mov rax, r13
+    imul rax, DIMS * 4
+    lea r14, [rbx + rax]                 ; src f32 ptr for cluster c
+
+    xor ecx, ecx                         ; dim d
+.dim_loop:
+    cmp ecx, DIMS
+    jae .next_cluster
+
+    movss xmm0, dword [r14 + rcx * 4]
+    mulss xmm0, xmm1
+    cvttss2si edx, xmm0                  ; signed truncate, identical to scalar path
+
+    mov rax, rcx
+    shl rax, 8                           ; d * 256 (in shorts)
+    add rax, r13                         ; + cluster id
+    lea r8, [rel cents_i16_soa]
+    mov [r8 + rax * 2], dx               ; word store
+
+    inc ecx
+    jmp .dim_loop
+
+.next_cluster:
+    inc r13
+    jmp .cluster_loop
+
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; centroid_distance_i16_soa — integer L2 distance using pre-baked i16 SoA.
+;   In : rdi = cluster_id
+;   Out: rax = u64 squared distance (i16 scale)
+;   Same arithmetic as centroid_distance_scalar but skips the f32→i16
+;   conversion that the bake already paid for at startup.
+; ============================================================
+centroid_distance_i16_soa:
+    push rbx
+
+    lea rbx, [rel cents_i16_soa]
+    lea rsi, [rel query_i16]
+    xor rax, rax
+    xor ecx, ecx
+
+.loop:
+    cmp ecx, DIMS
+    jae .done
+
+    mov r8, rcx
+    shl r8, 9                            ; d * 512 bytes (= d * 256 shorts * 2)
+    lea r9, [r8 + rdi * 2]               ; + cluster_id * 2 bytes
+
+    movsx r10d, word [rbx + r9]          ; centroid lane
+    movsx r11d, word [rsi + rcx * 2]     ; query lane
+    sub r11d, r10d
+    imul r11d, r11d
+    movsxd r11, r11d
+    add rax, r11
+
+    inc ecx
+    jmp .loop
+
+.done:
     pop rbx
     ret
 
@@ -2938,7 +3304,11 @@ load_index_optional:
     mov qword [rel index_loaded], 0
 
     mov eax, SYS_open
+    mov rdi, [rel index_path_override]
+    test rdi, rdi
+    jnz .have_path
     lea rdi, [rel index_path]
+.have_path:
     mov esi, O_RDONLY
     xor edx, edx
     syscall
@@ -3037,6 +3407,7 @@ load_index_optional:
     mov [rel index_base], r13
     mov [rel index_len], r12
     mov qword [rel index_format], 1
+    call bake_centroids_i16_soa
     mov qword [rel index_loaded], 1
     jmp .return
 
@@ -3094,6 +3465,7 @@ load_index_optional:
     mov [rel index_base], r13
     mov [rel index_len], r12
     mov qword [rel index_format], 2
+    call bake_centroids_i16_soa
     mov qword [rel index_loaded], 1
     jmp .return
 
@@ -3160,6 +3532,7 @@ load_index_optional:
     mov [rel index_base], r13
     mov [rel index_len], r12
     mov qword [rel index_format], 3
+    call bake_centroids_i16_soa
     mov qword [rel index_loaded], 1
     jmp .return
 
