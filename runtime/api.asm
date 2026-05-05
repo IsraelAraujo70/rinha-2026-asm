@@ -31,6 +31,7 @@ one_int: dd 1
 
 section .data
 index_loaded:      dq 0
+index_format:      dq 0       ; 1=RINHA26 AoS32, 2=IVF6 AoS28+labels
 index_base:        dq 0
 index_len:         dq 0
 index_count:       dq 0
@@ -40,6 +41,8 @@ cluster_offsets_ptr: dq 0
 bbox_min_ptr:      dq 0
 bbox_max_ptr:      dq 0
 records_ptr:       dq 0
+labels_ptr:        dq 0
+record_stride:     dq 0
 
 section .bss
 ; Per-connection scratch. 16 KiB covers the largest payload we'll see (the
@@ -76,6 +79,7 @@ card_present_key: db '"card_present"'
 card_present_key_len equ $ - card_present_key
 index_path: db '/index/data.bin', 0
 index_magic: db 'RINHA26', 0
+ivf6_magic: db 'IVF6'
 f32_10000: dd 10000.0
 distance_mask_i16:
     times 14 dw -1
@@ -83,8 +87,10 @@ distance_mask_i16:
 
 IVF_HEADER_LEN equ 32
 IVF_VERSION equ 3
+IVF6_HEADER_LEN equ 24
 DIMS equ 14
 IVF_RECORD_LEN equ 32
+IVF6_RECORD_LEN equ 28
 
 section .text
 
@@ -638,34 +644,60 @@ knn_count_first_clusters:
 
     lea r11, [rel cluster_best_id]
     mov rax, [r11 + rbp * 8]      ; selected cluster id
-    mov r12, [rbx + rax * 8]      ; start offset
+    cmp qword [rel index_format], 2
+    je .load_ivf6_offsets
+    mov r12, [rbx + rax * 8]      ; start offset (RINHA26 u64)
     mov r13, [rbx + rax * 8 + 8]  ; end offset
+    jmp .offsets_loaded
+
+.load_ivf6_offsets:
+    mov r12d, [rbx + rax * 4]     ; start offset (IVF6 u32)
+    mov r13d, [rbx + rax * 4 + 4] ; end offset
+
+.offsets_loaded:
     cmp r13, r12
     jbe .next_cluster
 
     mov r14, [rel records_ptr]
     mov rax, r12
-    shl rax, 5                    ; * IVF_RECORD_LEN (32)
+    imul rax, [rel record_stride]
     add r14, rax                  ; current record ptr
 
     mov r10, r13
     sub r10, r12                  ; records remaining
+    mov r11, r12                  ; current absolute record index
 
 .record_loop:
     test r10, r10
     jz .next_cluster
 
+    cmp qword [rel index_format], 2
+    je .ivf6_label
+    movzx esi, byte [r14 + 28]
+    jmp .label_loaded
+
+.ivf6_label:
+    mov rax, [rel labels_ptr]
+    movzx esi, byte [rax + r11]
+
+.label_loaded:
     mov rdi, r14
     push r10
+    push r11
+    push rsi
     call squared_distance_record_avx2
+    pop rsi
+    pop r11
     pop r10
-    movzx esi, byte [r14 + 28]
     mov rdi, rax
     push r10
+    push r11
     call insert_best_u64_asm
+    pop r11
     pop r10
 
-    add r14, IVF_RECORD_LEN
+    add r14, [rel record_stride]
+    inc r11
     dec r10
     jmp .record_loop
 
@@ -1136,7 +1168,11 @@ parse_bool_after_colon:
     ret
 
 ; ============================================================
-; load_index_optional — mmap /index/data.bin if present and parse IVF v3.
+; load_index_optional — mmap /index/data.bin if present.
+; Supports:
+;   - RINHA26 IVF v3: old experiment format, AoS32 records with label inline
+;   - IVF6: competitive K=256 format used by the public C top implementation,
+;           AoS28 vectors followed by labels and original ids
 ;   Startup intentionally keeps serving if the file is absent while the early
 ;   waves still use heuristic scoring. Once KNN is wired, absence becomes fatal.
 ; ============================================================
@@ -1192,6 +1228,10 @@ load_index_optional:
     cmp r12, IVF_HEADER_LEN
     jb .return
 
+    cmp dword [r13], 0x36465649    ; "IVF6"
+    je .parse_ivf6
+
+.parse_rinha26:
     mov rax, [r13]
     cmp rax, [rel index_magic]
     jne .return
@@ -1235,9 +1275,65 @@ load_index_optional:
     imul rax, DIMS * 2
     add r14, rax
     mov [rel records_ptr], r14
+    mov qword [rel labels_ptr], 0
+    mov qword [rel record_stride], IVF_RECORD_LEN
 
     mov [rel index_base], r13
     mov [rel index_len], r12
+    mov qword [rel index_format], 1
+    mov qword [rel index_loaded], 1
+    jmp .return
+
+.parse_ivf6:
+    cmp r12, IVF6_HEADER_LEN
+    jb .return
+    cmp dword [r13 + 12], DIMS     ; d
+    jne .return
+    cmp dword [r13 + 16], DIMS     ; stride
+    jne .return
+
+    mov eax, [r13 + 4]             ; n
+    test eax, eax
+    jz .return
+    mov [rel index_count], rax
+    mov eax, [r13 + 8]             ; k
+    test eax, eax
+    jz .return
+    mov [rel index_clusters], rax
+
+    lea r14, [r13 + IVF6_HEADER_LEN]
+    mov [rel centroids_ptr], r14
+
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 4
+    add r14, rax
+    mov [rel bbox_min_ptr], r14
+
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 2
+    add r14, rax
+    mov [rel bbox_max_ptr], r14
+
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 2
+    add r14, rax
+    mov [rel cluster_offsets_ptr], r14
+
+    mov rax, [rel index_clusters]
+    inc rax
+    shl rax, 2                    ; IVF6 offsets are u32
+    add r14, rax
+    mov [rel records_ptr], r14
+
+    mov rax, [rel index_count]
+    imul rax, DIMS * 2
+    add r14, rax
+    mov [rel labels_ptr], r14
+
+    mov qword [rel record_stride], IVF6_RECORD_LEN
+    mov [rel index_base], r13
+    mov [rel index_len], r12
+    mov qword [rel index_format], 2
     mov qword [rel index_loaded], 1
     jmp .return
 
