@@ -118,6 +118,56 @@ merchant_id_ptr: resq 1
 merchant_id_len: resq 1
 last_ts_ptr: resq 1
 
+; ---- Wave 21: epoll event-loop state ----
+; Per-fd metadata, 32 bytes per slot indexed by raw fd. Holds I/O state
+; machine fields in one cache line; keeps the big recv buffer in a
+; separate flat array (fd_buffers) so address math is a single shl.
+;
+; Layout (32 bytes per fd):
+;   +0  state    u8   FD_FREE / FD_READING_HEADERS / ... / FD_WRITING
+;   +1  pad[3]
+;   +4  recv_len    u32  bytes accumulated in fd_buffers[fd]
+;   +8  body_offset u32  offset of first body byte (after \r\n\r\n)
+;   +12 body_total  u32  body_offset + Content-Length (total bytes for full req)
+;   +16 resp_ptr    u64  pointer into rodata response table
+;   +24 resp_len    u32  response total length
+;   +28 resp_sent   u32  response bytes already written
+%define FDM_SIZE         32
+%define FDM_state         0
+%define FDM_recv_len      4
+%define FDM_body_offset   8
+%define FDM_body_total   12
+%define FDM_resp_ptr     16
+%define FDM_resp_len     24
+%define FDM_resp_sent    28
+
+%define FD_FREE             0
+%define FD_READING_HEADERS  1
+%define FD_READING_BODY     2
+%define FD_WRITING          5
+
+%define MAX_FDS         1024
+%define RECV_BUF_SIZE  16384
+%define MAX_EVENTS        32
+%define READY_QUEUE_SIZE 256
+%define EPOLL_EVENT_SIZE 12     ; packed { u32 events; u64 data; }
+
+alignb 64
+fd_meta:    resb MAX_FDS * FDM_SIZE          ; 32 KB
+alignb 64
+fd_buffers: resb MAX_FDS * RECV_BUF_SIZE     ; 16 MB
+
+alignb 8
+ready_queue: resd READY_QUEUE_SIZE
+ready_head:  resd 1                          ; producer index
+ready_tail:  resd 1                          ; consumer index
+
+alignb 8
+listen_event:           resb EPOLL_EVENT_SIZE
+client_event_template:  resb EPOLL_EVENT_SIZE
+client_event_out:       resb EPOLL_EVENT_SIZE
+events_buf:             resb MAX_EVENTS * EPOLL_EVENT_SIZE
+
 %include "responses.inc"
 
 ; Patterns for path matching and header search.
@@ -207,7 +257,7 @@ _start:
 .setup_tcp_socket:
     mov eax, SYS_socket
     mov edi, AF_INET
-    mov esi, SOCK_STREAM
+    mov esi, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
     xor edx, edx
     syscall
     test rax, rax
@@ -236,12 +286,12 @@ _start:
     syscall
     test rax, rax
     js .die
-    jmp .accept_loop
+    jmp .setup_epoll
 
 .setup_unix_socket:
     mov eax, SYS_socket
     mov edi, AF_UNIX
-    mov esi, SOCK_STREAM
+    mov esi, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
     xor edx, edx
     syscall
     test rax, rax
@@ -303,33 +353,485 @@ _start:
     test rax, rax
     js .die
 
-.accept_loop:
-    mov eax, SYS_accept4
-    mov rdi, r12
-    xor esi, esi
-    xor edx, edx
-    xor r10, r10
+    ; Wave 21: epoll edge-triggered event loop replaces the synchronous
+    ; accept→read→write→close path. SOCK_NONBLOCK on the listen socket
+    ; makes accept4 non-blocking; epoll batches I/O readiness across all
+    ; fds. Compute (route_request) is still serialized — single-threaded
+    ; replicas don't gain from concurrent compute, and BSS scratch
+    ; (query_i16, best_*, cluster_*) stays shared without races.
+.setup_epoll:
+    mov eax, SYS_epoll_create1
+    mov edi, EPOLL_CLOEXEC
     syscall
     test rax, rax
-    js .accept_loop
-    mov r13, rax              ; r13 = client fd, lives until close
+    js .die
+    mov rbx, rax                            ; rbx = epfd, lives forever
 
-.serve_loop:
-    call serve_one_request
-    test rax, rax
-    js .close_client
-    jmp .serve_loop
+    ; listen_event = { events = EPOLLIN | EPOLLET, data = listen_fd }
+    mov dword [rel listen_event + 0], EPOLLIN | EPOLLET
+    mov [rel listen_event + 4], r12
 
-.close_client:
-    mov eax, SYS_close
-    mov rdi, r13
+    mov eax, SYS_epoll_ctl
+    mov rdi, rbx
+    mov esi, EPOLL_CTL_ADD
+    mov rdx, r12
+    lea r10, [rel listen_event]
     syscall
-    jmp .accept_loop
+    test rax, rax
+    js .die
+
+.event_loop:
+    mov eax, SYS_epoll_wait
+    mov rdi, rbx
+    lea rsi, [rel events_buf]
+    mov edx, MAX_EVENTS
+    mov r10, -1
+    syscall
+    test rax, rax
+    js .event_loop                          ; EINTR or transient: retry
+    mov r14, rax                            ; r14 = n events
+
+    xor r15, r15                            ; r15 = i
+.dispatch_loop:
+    cmp r15, r14
+    jge .after_events
+
+    ; events_buf[r15] is at offset r15*12; event = {u32 events, u64 data}
+    mov rax, r15
+    lea rax, [rax + rax*2]                  ; r15 * 3
+    shl rax, 2                              ; r15 * 12
+    lea rdi, [rel events_buf]
+    add rdi, rax                            ; rdi = &events_buf[r15]
+    mov ecx, [rdi]                          ; events
+    mov r13d, [rdi + 4]                     ; fd (low 32 of data)
+
+    cmp r13d, r12d
+    je .accept_burst
+
+    ; Client fd path. Drain EPOLLIN first (may close on EOF), then
+    ; EPOLLOUT, then EPOLLERR/EPOLLHUP — guard each stage against an
+    ; already-freed slot so we don't double-close.
+    test ecx, EPOLLIN
+    jz .skip_read
+    push rcx
+    call handle_read
+    pop rcx
+    mov rax, r13
+    shl rax, 5
+    lea rdi, [rel fd_meta]
+    cmp byte [rdi + rax + FDM_state], FD_FREE
+    je .next_event
+.skip_read:
+    test ecx, EPOLLOUT
+    jz .skip_write
+    mov rax, r13
+    shl rax, 5
+    lea rdi, [rel fd_meta]
+    cmp byte [rdi + rax + FDM_state], FD_WRITING
+    jne .skip_write
+    push rcx
+    call handle_write_continuation
+    pop rcx
+    mov rax, r13
+    shl rax, 5
+    lea rdi, [rel fd_meta]
+    cmp byte [rdi + rax + FDM_state], FD_FREE
+    je .next_event
+.skip_write:
+    test ecx, EPOLLERR | EPOLLHUP
+    jz .next_event
+    mov rax, r13
+    shl rax, 5
+    lea rdi, [rel fd_meta]
+    cmp byte [rdi + rax + FDM_state], FD_FREE
+    je .next_event
+    call close_and_free
+    jmp .next_event
+
+.accept_burst:
+    call accept_until_eagain
+.next_event:
+    inc r15
+    jmp .dispatch_loop
+
+.after_events:
+    call drain_ready_queue
+    jmp .event_loop
 
 .die:
     mov eax, SYS_exit_group
     mov edi, 1
     syscall
+
+; ============================================================
+; accept_until_eagain — drain pending accepts on r12 (listen_fd) until
+; EAGAIN. For each new fd: init meta slot, EPOLL_CTL_ADD with
+; EPOLLIN | EPOLLET. Reject (close) any fd >= MAX_FDS.
+;   In : r12 = listen_fd, rbx = epfd
+; ============================================================
+accept_until_eagain:
+    push rbx
+    push r12
+.al_loop:
+    mov eax, SYS_accept4
+    mov rdi, r12
+    xor esi, esi
+    xor edx, edx
+    mov r10d, SOCK_NONBLOCK | SOCK_CLOEXEC
+    syscall
+    test rax, rax
+    js .al_check_eagain
+
+    cmp eax, MAX_FDS
+    jae .al_reject
+
+    mov r9, rax                             ; preserve fd across slot init
+
+    mov rdi, r9
+    shl rdi, 5                              ; fd * FDM_SIZE (32)
+    lea rax, [rel fd_meta]
+    add rdi, rax                            ; rdi = &meta[fd]
+    mov byte [rdi + FDM_state], FD_READING_HEADERS
+    mov dword [rdi + FDM_recv_len], 0
+    mov dword [rdi + FDM_body_offset], 0
+    mov dword [rdi + FDM_body_total], 0
+    mov qword [rdi + FDM_resp_ptr], 0
+    mov dword [rdi + FDM_resp_len], 0
+    mov dword [rdi + FDM_resp_sent], 0
+
+    mov dword [rel client_event_template + 0], EPOLLIN | EPOLLET
+    mov [rel client_event_template + 4], r9
+
+    mov eax, SYS_epoll_ctl
+    mov rdi, rbx
+    mov esi, EPOLL_CTL_ADD
+    mov rdx, r9
+    lea r10, [rel client_event_template]
+    syscall
+    jmp .al_loop
+
+.al_reject:
+    mov rdi, rax
+    mov eax, SYS_close
+    syscall
+    jmp .al_loop
+
+.al_check_eagain:
+    cmp rax, NEG_EAGAIN
+    je .al_done
+.al_done:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; handle_read — drain reads on r13 until EAGAIN, advance state machine,
+; enqueue to ready_queue when full request is buffered. May transition
+; the slot to FD_FREE on EOF/error/buffer-overflow.
+;   In : r13 = client fd, rbx = epfd
+; ============================================================
+handle_read:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rax, r13
+    shl rax, 5
+    lea r14, [rel fd_meta]
+    add r14, rax                            ; r14 = &meta[fd]
+
+    mov rax, r13
+    shl rax, 14                             ; fd * RECV_BUF_SIZE (16384)
+    lea r15, [rel fd_buffers]
+    add r15, rax                            ; r15 = &buf[fd]
+
+.hr_loop:
+    mov ecx, [r14 + FDM_recv_len]
+    mov edx, RECV_BUF_SIZE
+    sub edx, ecx
+    jbe .hr_drop                            ; buffer would overflow
+
+    mov eax, SYS_read
+    mov rdi, r13
+    lea rsi, [r15 + rcx]
+    syscall
+    test rax, rax
+    je .hr_drop                             ; EOF
+    js .hr_check_eagain
+
+    add [r14 + FDM_recv_len], eax
+    jmp .hr_try_promote
+
+.hr_check_eagain:
+    cmp rax, NEG_EAGAIN
+    je .hr_eagain_promote
+    jmp .hr_drop
+
+.hr_try_promote:
+    mov al, [r14 + FDM_state]
+    cmp al, FD_READING_HEADERS
+    je .hr_try_headers
+    cmp al, FD_READING_BODY
+    je .hr_try_body
+    jmp .hr_loop
+
+.hr_try_headers:
+    mov rdi, r15
+    mov esi, [r14 + FDM_recv_len]
+    call find_crlf_crlf
+    test rax, rax
+    js .hr_loop                             ; \r\n\r\n not yet, read more
+    push rax                                ; save headers_len
+    lea ecx, [eax + 4]
+    mov [r14 + FDM_body_offset], ecx
+    mov rdi, r15
+    pop rsi                                 ; rsi = headers_len
+    call parse_content_length               ; rax = content length
+    add eax, [r14 + FDM_body_offset]
+    cmp eax, RECV_BUF_SIZE
+    ja .hr_drop
+    mov [r14 + FDM_body_total], eax
+    mov byte [r14 + FDM_state], FD_READING_BODY
+    jmp .hr_try_body
+
+.hr_try_body:
+    mov eax, [r14 + FDM_recv_len]
+    cmp eax, [r14 + FDM_body_total]
+    jb .hr_loop                             ; need more bytes; keep reading
+
+    ; Complete request — enqueue and exit.
+    mov byte [r14 + FDM_state], 3           ; FD_READY (transient)
+    mov edx, [rel ready_tail]
+    lea rdi, [rel ready_queue]
+    mov [rdi + rdx*4], r13d
+    inc edx
+    and edx, READY_QUEUE_SIZE - 1
+    mov [rel ready_tail], edx
+    jmp .hr_done
+
+.hr_eagain_promote:
+    ; Last read returned EAGAIN. Try one final state advance, but don't
+    ; loop back into read (kernel buffer is empty per ET semantics).
+    mov al, [r14 + FDM_state]
+    cmp al, FD_READING_HEADERS
+    jne .hr_eagain_check_body
+    mov rdi, r15
+    mov esi, [r14 + FDM_recv_len]
+    call find_crlf_crlf
+    test rax, rax
+    js .hr_done                             ; no \r\n\r\n yet; wait for more
+    push rax
+    lea ecx, [eax + 4]
+    mov [r14 + FDM_body_offset], ecx
+    mov rdi, r15
+    pop rsi
+    call parse_content_length
+    add eax, [r14 + FDM_body_offset]
+    cmp eax, RECV_BUF_SIZE
+    ja .hr_drop
+    mov [r14 + FDM_body_total], eax
+    mov byte [r14 + FDM_state], FD_READING_BODY
+.hr_eagain_check_body:
+    cmp byte [r14 + FDM_state], FD_READING_BODY
+    jne .hr_done
+    mov eax, [r14 + FDM_recv_len]
+    cmp eax, [r14 + FDM_body_total]
+    jb .hr_done                             ; need more bytes; wait
+    mov byte [r14 + FDM_state], 3           ; FD_READY
+    mov edx, [rel ready_tail]
+    lea rdi, [rel ready_queue]
+    mov [rdi + rdx*4], r13d
+    inc edx
+    and edx, READY_QUEUE_SIZE - 1
+    mov [rel ready_tail], edx
+    jmp .hr_done
+
+.hr_drop:
+    call close_and_free
+
+.hr_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; handle_write_continuation — finish a partial write on r13 until EAGAIN
+; or completion (then close).
+;   In : r13 = client fd
+; ============================================================
+handle_write_continuation:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov rax, r13
+    shl rax, 5
+    lea r14, [rel fd_meta]
+    add r14, rax
+
+.hw_loop:
+    mov edx, [r14 + FDM_resp_len]
+    mov ecx, [r14 + FDM_resp_sent]
+    sub edx, ecx
+    jz .hw_close
+
+    mov rsi, [r14 + FDM_resp_ptr]
+    add rsi, rcx
+    mov eax, SYS_write
+    mov rdi, r13
+    syscall
+    test rax, rax
+    js .hw_check_eagain
+
+    add [r14 + FDM_resp_sent], eax
+    jmp .hw_loop
+
+.hw_check_eagain:
+    cmp rax, NEG_EAGAIN
+    je .hw_done                             ; wait for next EPOLLOUT
+.hw_close:
+    call close_and_free
+
+.hw_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; drain_ready_queue — pop each fd from ready_queue, run route_request,
+; write inline; close on full write or arm EPOLLOUT on partial / EAGAIN.
+; ============================================================
+drain_ready_queue:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+.dr_loop:
+    mov ecx, [rel ready_head]
+    mov edx, [rel ready_tail]
+    cmp ecx, edx
+    je .dr_done
+
+    lea rdi, [rel ready_queue]
+    mov r13d, [rdi + rcx*4]
+    inc ecx
+    and ecx, READY_QUEUE_SIZE - 1
+    mov [rel ready_head], ecx
+
+    mov rax, r13
+    shl rax, 5
+    lea r14, [rel fd_meta]
+    add r14, rax
+
+    mov rax, r13
+    shl rax, 14
+    lea r15, [rel fd_buffers]
+    add r15, rax
+
+    mov rdi, r15                            ; headers_ptr (start of buf)
+    mov rsi, r15
+    mov ecx, [r14 + FDM_body_offset]
+    add rsi, rcx                            ; body_ptr
+    mov edx, [r14 + FDM_recv_len]
+    sub edx, ecx                            ; body_len
+    call route_request                      ; rax = resp_ptr, rdx = resp_len
+
+    mov [r14 + FDM_resp_ptr], rax
+    mov [r14 + FDM_resp_len], edx
+    mov dword [r14 + FDM_resp_sent], 0
+
+    mov rsi, rax
+    mov rdi, r13
+    mov eax, SYS_write
+    syscall                                 ; rdx still holds resp_len
+    test rax, rax
+    js .dr_check_eagain
+
+    add [r14 + FDM_resp_sent], eax
+    mov ecx, [r14 + FDM_resp_sent]
+    cmp ecx, [r14 + FDM_resp_len]
+    jb .dr_partial
+    call close_and_free
+    jmp .dr_loop
+
+.dr_partial:
+    mov byte [r14 + FDM_state], FD_WRITING
+    call arm_epollout
+    jmp .dr_loop
+
+.dr_check_eagain:
+    cmp rax, NEG_EAGAIN
+    jne .dr_force_close
+    mov byte [r14 + FDM_state], FD_WRITING
+    call arm_epollout
+    jmp .dr_loop
+
+.dr_force_close:
+    call close_and_free
+    jmp .dr_loop
+
+.dr_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; close_and_free — close r13 and reset its meta slot.
+;   In : r13 = client fd
+; ============================================================
+close_and_free:
+    push r12
+    push r13
+
+    mov eax, SYS_close
+    mov rdi, r13
+    syscall
+
+    mov rax, r13
+    shl rax, 5
+    lea rdi, [rel fd_meta]
+    add rdi, rax
+
+    mov byte [rdi + FDM_state], FD_FREE
+    mov dword [rdi + FDM_recv_len], 0
+    mov dword [rdi + FDM_body_offset], 0
+    mov dword [rdi + FDM_body_total], 0
+    mov qword [rdi + FDM_resp_ptr], 0
+    mov dword [rdi + FDM_resp_len], 0
+    mov dword [rdi + FDM_resp_sent], 0
+
+    pop r13
+    pop r12
+    ret
+
+; ============================================================
+; arm_epollout — EPOLL_CTL_MOD r13 to add EPOLLOUT (kept ET).
+;   In : r13 = client fd, rbx = epfd
+; ============================================================
+arm_epollout:
+    mov dword [rel client_event_out + 0], EPOLLIN | EPOLLOUT | EPOLLET
+    mov [rel client_event_out + 4], r13
+    mov eax, SYS_epoll_ctl
+    mov rdi, rbx
+    mov esi, EPOLL_CTL_MOD
+    mov rdx, r13
+    lea r10, [rel client_event_out]
+    syscall
+    ret
+
 %endif ; BENCH_BUILD
 
 ; ============================================================
@@ -472,97 +974,6 @@ parse_uint_zstr:
     inc rdi
     jmp .loop
 .ret:
-    ret
-
-; ============================================================
-; serve_one_request — read+parse one HTTP request and write the response.
-;   In : r13 = client fd
-;   Out: rax = 0 (keep-alive), -1 (close)
-;   Locals (callee-saved): rbx = body offset, r14 = bytes accumulated,
-;                          r15 = total bytes needed
-; ============================================================
-serve_one_request:
-    push rbx
-    push r14
-    push r15
-
-    xor r14, r14              ; bytes accumulated in recv_buf
-
-.read_until_headers:
-    mov eax, SYS_read
-    mov rdi, r13
-    lea rsi, [rel recv_buf]
-    add rsi, r14
-    mov edx, 16384
-    sub rdx, r14
-    jle .conn_drop            ; buffer full without seeing \r\n\r\n
-    syscall
-    test rax, rax
-    jle .conn_drop            ; EOF (0) or read error (<0)
-    add r14, rax
-
-    lea rdi, [rel recv_buf]
-    mov rsi, r14
-    call find_crlf_crlf
-    test rax, rax
-    js .read_until_headers
-
-    ; rax = headers length (offset of \r\n\r\n start)
-    lea rbx, [rax + 4]        ; rbx = body offset (after the \r\n\r\n)
-
-    lea rdi, [rel recv_buf]
-    mov rsi, rax              ; pass headers length
-    call parse_content_length
-    ; rax = content length (0 if header missing)
-
-    add rax, rbx
-    mov r15, rax              ; total bytes needed
-
-    cmp r15, 16384
-    ja .conn_drop             ; payload bigger than our buffer — drop
-
-.read_until_body_done:
-    cmp r14, r15
-    jae .have_full_request
-
-    mov eax, SYS_read
-    mov rdi, r13
-    lea rsi, [rel recv_buf]
-    add rsi, r14
-    mov edx, 16384
-    sub rdx, r14
-    syscall
-    test rax, rax
-    jle .conn_drop
-    add r14, rax
-    jmp .read_until_body_done
-
-.have_full_request:
-    lea rdi, [rel recv_buf]
-    lea rsi, [rel recv_buf]
-    add rsi, rbx              ; rsi = body ptr
-    mov rdx, r14
-    sub rdx, rbx              ; rdx = buffered body length
-    call route_request        ; rax = response ptr, rdx = response length
-
-    mov rsi, rax
-    mov eax, SYS_write
-    mov rdi, r13
-    syscall
-    ; Synchronous server: close after each response so HAProxy cannot pin the
-    ; process on one idle keep-alive fd. UDS reconnect is cheap and this keeps
-    ; the accept loop available for the next queued request.
-    mov rax, -1
-    pop r15
-    pop r14
-    pop rbx
-    ret
-
-.conn_drop:
-    mov rax, -1
-    pop r15
-    pop r14
-    pop rbx
     ret
 
 ; ============================================================

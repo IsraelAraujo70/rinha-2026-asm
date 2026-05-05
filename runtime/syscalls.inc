@@ -30,6 +30,8 @@
 %define AF_INET            2
 %define AF_UNIX            1
 %define SOCK_STREAM        1
+%define SOCK_NONBLOCK 0x000800
+%define SOCK_CLOEXEC  0x080000
 %define SOL_SOCKET         1
 %define SO_REUSEADDR       2
 %define SO_REUSEPORT      15
@@ -54,6 +56,10 @@
 %define EPOLLERR       0x008
 %define EPOLLHUP       0x010
 %define EPOLLET   0x80000000
+%define EPOLL_CLOEXEC 0x080000
+
+; ---- errno (negative as returned by syscalls in rax) ----
+%define NEG_EAGAIN       -11    ; EWOULDBLOCK == EAGAIN on Linux
 
 ; ---- fcntl / open ----
 %define O_RDONLY           0
