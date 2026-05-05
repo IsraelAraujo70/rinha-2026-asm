@@ -1710,6 +1710,32 @@ scan_cluster_id:
     vpaddq ymm6, ymm6, ymm4
 %endmacro
 
+; PR-A4: SIMD lower-bound pruning for the 8-batch. After processing the
+; most discriminant dims, compute hmin(ymm5 ∥ ymm6) — min squared partial
+; dist across the 8 records — and skip the rest of the batch when it
+; already exceeds best_dist[4]. Sum-of-squares is monotonic in dims, so a
+; record can only get further from the query; if min partial > worst-of-
+; top-5, all 8 finals do too and insert_best_u64_asm would reject them.
+;
+; Preserves ymm5/ymm6 (still live for next ACC_SOA_DIM8 if not pruned).
+; Clobbers ymm7/xmm7 (free in scan_cluster_soa_avx2), ymm0/ymm1 (next
+; ACC_SOA_DIM8 overwrites them anyway), and rax. AVX2 has no vpminuq, so
+; emulate via vpcmpgtq + vpblendvb. Squared dists ≤ 14·(2¹⁶)² < 2³⁶ are
+; signed-positive, so signed gt matches unsigned min.
+%macro CHECK_PRUNE_8 1
+    vpcmpgtq ymm7, ymm5, ymm6           ; mask = (lo > hi) per qword
+    vpblendvb ymm7, ymm5, ymm6, ymm7    ; ymm7 = min(lo, hi), 4 i64
+    vextracti128 xmm0, ymm7, 1          ; xmm0 = high 2 i64 of ymm7
+    vpcmpgtq xmm1, xmm7, xmm0
+    vpblendvb xmm7, xmm7, xmm0, xmm1    ; xmm7 = min, 2 i64
+    vpshufd xmm0, xmm7, 0x4E            ; swap qwords
+    vpcmpgtq xmm1, xmm7, xmm0
+    vpblendvb xmm7, xmm7, xmm0, xmm1    ; xmm7 lane0 = min of 8
+    vmovq rax, xmm7
+    cmp rax, [rel best_dist + 4 * 8]
+    ja %1
+%endmacro
+
 ; PR-A3: 4-record XMM batch for the SIVF tail (records past the last
 ; full block of 8). Mirrors ACC_SOA_DIM8 at half width (4 i32 lanes per
 ; xmm). Accumulators xmm5/xmm6 each hold 2 × i64. No early-exit since
@@ -1765,6 +1791,7 @@ scan_cluster_soa_avx2:
     ACC_SOA_DIM8 6
     ACC_SOA_DIM8 2
     ACC_SOA_DIM8 0
+    CHECK_PRUNE_8 .next_vec
     ACC_SOA_DIM8 7
     ACC_SOA_DIM8 8
     ACC_SOA_DIM8 11
