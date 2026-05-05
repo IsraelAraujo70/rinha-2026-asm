@@ -63,6 +63,8 @@ cluster_best_id: resq 8
 cluster_visited: resb 4096
 dist_lanes: resd 8
 dim_ptrs: resq 14
+soa_tmp_lo: resq 4
+soa_tmp_hi: resq 4
 txn_ptr: resq 1
 txn_len: resq 1
 customer_ptr: resq 1
@@ -1486,6 +1488,161 @@ scan_cluster_id:
     cmp r8, [rel best_dist + 4 * 8]
     ja .skip_record
 %endmacro
+
+%macro ACC_SOA_DIM8 1
+    movsx eax, word [rel query_i16 + %1 * 2]
+    vmovd xmm2, eax
+    vpbroadcastd ymm2, xmm2
+    mov rax, [rel dim_ptrs + %1 * 8]
+    vmovdqu xmm0, [rax + r11 * 2]
+    vpmovsxwd ymm1, xmm0
+    vpsubd ymm1, ymm1, ymm2
+    vpmulld ymm1, ymm1, ymm1
+    vpmovsxdq ymm3, xmm1
+    vextracti128 xmm4, ymm1, 1
+    vpmovsxdq ymm4, xmm4
+    vpaddq ymm5, ymm5, ymm3
+    vpaddq ymm6, ymm6, ymm4
+%endmacro
+
+; ============================================================
+; scan_cluster_soa_avx2 — SIVF scan, eight records per vector chunk.
+;   In : rdi = cluster id
+; ============================================================
+scan_cluster_soa_avx2:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+
+    mov rbp, rdi
+    mov rbx, [rel cluster_offsets_ptr]
+    mov r12d, [rbx + rbp * 4]      ; start
+    mov r13d, [rbx + rbp * 4 + 4]  ; end
+    cmp r13, r12
+    jbe .done
+
+    mov r14, r13
+    sub r14, r12
+    and r14, -8
+    add r14, r12                   ; vector loop limit
+    mov r11, r12
+
+.vec_loop:
+    cmp r11, r14
+    jae .tail
+    vpxor ymm5, ymm5, ymm5
+    vpxor ymm6, ymm6, ymm6
+
+    ACC_SOA_DIM8 5
+    ACC_SOA_DIM8 6
+    ACC_SOA_DIM8 2
+    ACC_SOA_DIM8 0
+    ACC_SOA_DIM8 7
+    ACC_SOA_DIM8 8
+    ACC_SOA_DIM8 11
+    ACC_SOA_DIM8 12
+    ACC_SOA_DIM8 9
+    ACC_SOA_DIM8 10
+    ACC_SOA_DIM8 1
+    ACC_SOA_DIM8 13
+    ACC_SOA_DIM8 3
+    ACC_SOA_DIM8 4
+
+    vmovdqu [rel soa_tmp_lo], ymm5
+    vmovdqu [rel soa_tmp_hi], ymm6
+    vzeroupper
+
+    xor ecx, ecx
+.lo_lanes:
+    cmp ecx, 4
+    jae .hi_start
+    lea r9, [rel soa_tmp_lo]
+    mov rdi, [r9 + rcx * 8]
+    mov rax, [rel ids_ptr]
+    lea r8, [r11 + rcx]
+    mov edx, [rax + r8 * 4]
+    mov rax, [rel labels_ptr]
+    movzx esi, byte [rax + r8]
+    push rcx
+    push r11
+    call insert_best_u64_asm
+    pop r11
+    pop rcx
+    inc ecx
+    jmp .lo_lanes
+
+.hi_start:
+    xor ecx, ecx
+.hi_lanes:
+    cmp ecx, 4
+    jae .next_vec
+    lea r9, [rel soa_tmp_hi]
+    mov rdi, [r9 + rcx * 8]
+    mov rax, [rel ids_ptr]
+    lea r8, [r11 + 4 + rcx]
+    mov edx, [rax + r8 * 4]
+    mov rax, [rel labels_ptr]
+    movzx esi, byte [rax + r8]
+    push rcx
+    push r11
+    call insert_best_u64_asm
+    pop r11
+    pop rcx
+    inc ecx
+    jmp .hi_lanes
+
+.next_vec:
+    add r11, 8
+    jmp .vec_loop
+
+.tail:
+    cmp r11, r13
+    jae .done
+    ; Tail uses the same early-exit scalar logic for the final 0..7 records.
+.tail_loop:
+    cmp r11, r13
+    jae .done
+    xor r8, r8
+    ACC_SOA_DIM 5
+    ACC_SOA_DIM 6
+    ACC_SOA_DIM 2
+    ACC_SOA_DIM 0
+    ACC_SOA_DIM 7
+    ACC_SOA_DIM 8
+    ACC_SOA_DIM 11
+    ACC_SOA_DIM 12
+    ACC_SOA_DIM 9
+    ACC_SOA_DIM 10
+    ACC_SOA_DIM 1
+    ACC_SOA_DIM 13
+    ACC_SOA_DIM 3
+    ACC_SOA_DIM 4
+
+    mov rax, [rel labels_ptr]
+    movzx esi, byte [rax + r11]
+    mov rax, [rel ids_ptr]
+    mov edx, [rax + r11 * 4]
+    mov rdi, r8
+    push r11
+    push r13
+    call insert_best_u64_asm
+    pop r13
+    pop r11
+
+.skip_record:
+    inc r11
+    jmp .tail_loop
+
+.done:
+    vzeroupper
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; ============================================================
 ; scan_cluster_soa_scalar — SIVF scan with early-exit dimension order.
