@@ -29,6 +29,18 @@ SOCKADDR_LEN equ $ - sockaddr_in
 
 one_int: dd 1
 
+section .data
+index_loaded:      dq 0
+index_base:        dq 0
+index_len:         dq 0
+index_count:       dq 0
+index_clusters:    dq 0
+centroids_ptr:     dq 0
+cluster_offsets_ptr: dq 0
+bbox_min_ptr:      dq 0
+bbox_max_ptr:      dq 0
+records_ptr:       dq 0
+
 section .bss
 ; Per-connection scratch. 16 KiB covers the largest payload we'll see (the
 ; Rinha references include ~500-byte JSON blobs; headers add ~200 bytes).
@@ -57,6 +69,13 @@ is_online_key: db '"is_online"'
 is_online_key_len equ $ - is_online_key
 card_present_key: db '"card_present"'
 card_present_key_len equ $ - card_present_key
+index_path: db '/index/data.bin', 0
+index_magic: db 'RINHA26', 0
+
+IVF_HEADER_LEN equ 32
+IVF_VERSION equ 3
+DIMS equ 14
+IVF_RECORD_LEN equ 32
 
 section .text
 
@@ -64,6 +83,8 @@ section .text
 ; _start — setup listener, then accept-serve loop forever.
 ; ============================================================
 _start:
+    call load_index_optional
+
     mov eax, SYS_socket
     mov edi, AF_INET
     mov esi, SOCK_STREAM
@@ -780,4 +801,122 @@ parse_bool_after_colon:
     ret
 .false:
     xor eax, eax
+    ret
+
+; ============================================================
+; load_index_optional — mmap /index/data.bin if present and parse IVF v3.
+;   Startup intentionally keeps serving if the file is absent while the early
+;   waves still use heuristic scoring. Once KNN is wired, absence becomes fatal.
+; ============================================================
+load_index_optional:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov qword [rel index_loaded], 0
+
+    mov eax, SYS_open
+    lea rdi, [rel index_path]
+    mov esi, O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .return
+    mov rbx, rax              ; fd
+
+    mov eax, SYS_lseek
+    mov rdi, rbx
+    xor esi, esi
+    mov edx, SEEK_END
+    syscall
+    test rax, rax
+    jle .close_return
+    mov r12, rax              ; file length
+
+    mov eax, SYS_lseek
+    mov rdi, rbx
+    xor esi, esi
+    mov edx, SEEK_SET
+    syscall
+
+    mov eax, SYS_mmap
+    xor edi, edi              ; addr = NULL
+    mov rsi, r12              ; len
+    mov edx, PROT_READ
+    mov r10d, MAP_PRIVATE
+    mov r8, rbx               ; fd
+    xor r9d, r9d              ; offset
+    syscall
+    ; Linux returns -errno in [-4095,-1].
+    cmp rax, -4095
+    jae .close_return
+    mov r13, rax              ; mmap base
+
+    mov eax, SYS_close
+    mov rdi, rbx
+    syscall
+
+    cmp r12, IVF_HEADER_LEN
+    jb .return
+
+    mov rax, [r13]
+    cmp rax, [rel index_magic]
+    jne .return
+    cmp dword [r13 + 8], IVF_VERSION
+    jne .return
+    cmp dword [r13 + 12], DIMS
+    jne .return
+
+    mov rax, [r13 + 16]
+    mov [rel index_count], rax
+    mov eax, [r13 + 24]
+    test eax, eax
+    jz .return
+    mov [rel index_clusters], rax
+
+    ; centroids_ptr = base + 32
+    lea r14, [r13 + IVF_HEADER_LEN]
+    mov [rel centroids_ptr], r14
+
+    ; cluster_offsets_ptr = centroids + clusters * DIMS * sizeof(f32)
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 4
+    add r14, rax
+    mov [rel cluster_offsets_ptr], r14
+
+    ; bbox_min_ptr = offsets + (clusters + 1) * sizeof(u64)
+    mov rax, [rel index_clusters]
+    inc rax
+    shl rax, 3
+    add r14, rax
+    mov [rel bbox_min_ptr], r14
+
+    ; bbox_max_ptr = bbox_min + clusters * DIMS * sizeof(i16)
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 2
+    add r14, rax
+    mov [rel bbox_max_ptr], r14
+
+    ; records_ptr = bbox_max + clusters * DIMS * sizeof(i16)
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 2
+    add r14, rax
+    mov [rel records_ptr], r14
+
+    mov [rel index_base], r13
+    mov [rel index_len], r12
+    mov qword [rel index_loaded], 1
+    jmp .return
+
+.close_return:
+    mov eax, SYS_close
+    mov rdi, rbx
+    syscall
+
+.return:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret

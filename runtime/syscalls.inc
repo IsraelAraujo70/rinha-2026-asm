@@ -10,6 +10,7 @@
 %define SYS_open           2
 %define SYS_close          3
 %define SYS_fstat          5
+%define SYS_lseek          8
 %define SYS_mmap           9
 %define SYS_brk           12
 %define SYS_socket        41
@@ -36,6 +37,10 @@
 %define MAP_SHARED         1
 %define MAP_PRIVATE        2
 %define MAP_ANONYMOUS   0x20
+
+; ---- lseek ----
+%define SEEK_SET           0
+%define SEEK_END           2
 
 ; ---- epoll ----
 %define EPOLL_CTL_ADD      1

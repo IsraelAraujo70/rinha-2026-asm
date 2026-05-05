@@ -12,11 +12,11 @@ A submissão "principal" em Rust vive na branch `refactor/secret-sauce` do mesmo
 - ✅ Parser HTTP básico (`Content-Length`, body offset, `/ready`, `/fraud-score`)
 - ✅ Parser JSON parcial por busca de chaves reais
 - ✅ Vectorização i16 parcial em `query_i16` (amount, installments, tx_count_24h, is_online, card_present)
+- ✅ Loader opcional do índice IVF v3 (`open` + `lseek` + `mmap` + header/offset parse)
 - ✅ Score temporário por heurística desses campos até o KNN entrar
 - ✅ Docker multi-stage com imagem final `FROM scratch`
 - ✅ docker-compose com nginx + 2 réplicas, mesma topologia da versão Rust
 - ⏳ Vectorize completo + datas ISO-8601 + `known_merchants`/MCC/last_transaction
-- ⏳ Loader do índice IVF v3 (mmap, parse header)
 - ⏳ Centroid scan + IVF k-NN com AVX2 `vpmaddwd`
 - ⏳ Adaptive nprobe (8 → 24 borderline) + early-exit
 - ⏳ `build_index` em asm (k-means++ + Lloyd + write IVF)
