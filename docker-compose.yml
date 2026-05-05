@@ -19,7 +19,7 @@ services:
           memory: "30MB"
 
   api1:
-    image: ghcr.io/israelaraujo70/rinha-2026-asm:678c840
+    image: ghcr.io/israelaraujo70/rinha-2026-asm:176c3b7
     platform: linux/amd64
 
     environment:
@@ -35,7 +35,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: ghcr.io/israelaraujo70/rinha-2026-asm:678c840
+    image: ghcr.io/israelaraujo70/rinha-2026-asm:176c3b7
     platform: linux/amd64
 
     environment:
