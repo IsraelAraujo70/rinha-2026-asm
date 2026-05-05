@@ -10,5 +10,6 @@ RUN make api
 # Runtime image: scratch + the static ELF. Nothing else.
 FROM scratch
 COPY --from=builder /build/build/api /api
+COPY resources/index.bin /index/data.bin
 EXPOSE 8080
 ENTRYPOINT ["/api"]
