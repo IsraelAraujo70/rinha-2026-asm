@@ -19,9 +19,9 @@ services:
           memory: "50MB"
 
   api1:
-    image: rinha-2026-asm:latest
+    image: ttl.sh/rinha-2026-asm-israelaraujo70-1777986132:24h
     platform: linux/amd64
-    build: .
+
     environment:
       SOCKET_PATH: /sockets/api1.sock
       IVF_NPROBE: "5"
@@ -35,9 +35,9 @@ services:
           memory: "160MB"
 
   api2:
-    image: rinha-2026-asm:latest
+    image: ttl.sh/rinha-2026-asm-israelaraujo70-1777986132:24h
     platform: linux/amd64
-    build: .
+
     environment:
       SOCKET_PATH: /sockets/api2.sock
       IVF_NPROBE: "5"
