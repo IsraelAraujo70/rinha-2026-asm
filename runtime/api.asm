@@ -48,6 +48,8 @@ recv_buf:  resb 16384
 ; Wave 3 quantized vector scratch: 16 i16 lanes so AVX2 can load one full ymm.
 ; Lanes 0..13 mirror the Rinha feature contract; lanes 14..15 stay zero.
 query_i16: resw 16
+best_dist: resq 5
+best_label: resb 5
 
 %include "responses.inc"
 
@@ -434,6 +436,12 @@ parse_score_count_from_json:
     mov r12, rsi              ; body length
 
     call vectorize_json_partial
+    cmp qword [rel index_loaded], 1
+    jne .heuristic
+    call knn_count_first_cluster
+    jmp .done
+
+.heuristic:
     call heuristic_count_from_vector
     jmp .done
 
@@ -567,6 +575,147 @@ heuristic_count_from_vector:
     cmp eax, 5
     jbe .ret
     mov eax, 5
+.ret:
+    ret
+
+; ============================================================
+; knn_count_first_cluster — scan the first IVF cluster with scalar i16 L2.
+;   Out: rax = number of fraud labels among the 5 nearest records in cluster 0
+;
+; This is Wave 5's first real index-backed KNN slice. It intentionally scans
+; only cluster 0; Wave 6 adds centroid selection and multi-cluster probing.
+; ============================================================
+knn_count_first_cluster:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Initialize best distances to UINT64_MAX and labels to 0.
+    lea rdi, [rel best_dist]
+    mov rax, -1
+    mov ecx, 5
+.init_dist:
+    mov [rdi], rax
+    add rdi, 8
+    loop .init_dist
+
+    lea rdi, [rel best_label]
+    xor eax, eax
+    mov ecx, 5
+.init_label:
+    mov [rdi], al
+    inc rdi
+    loop .init_label
+
+    mov rbx, [rel cluster_offsets_ptr]
+    test rbx, rbx
+    jz .fallback_zero
+    mov r12, [rbx]            ; start offset
+    mov r13, [rbx + 8]        ; end offset
+    cmp r13, r12
+    jbe .fallback_zero
+
+    mov r14, [rel records_ptr]
+    mov rax, r12
+    shl rax, 5                ; * IVF_RECORD_LEN (32)
+    add r14, rax              ; current record ptr
+
+    mov r15, r13
+    sub r15, r12              ; records remaining
+
+.scan:
+    test r15, r15
+    jz .score
+
+    mov rdi, r14
+    call squared_distance_record_scalar
+    movzx esi, byte [r14 + 28]
+    mov rdi, rax
+    call insert_best_u64_asm
+
+    add r14, IVF_RECORD_LEN
+    dec r15
+    jmp .scan
+
+.score:
+    xor eax, eax
+    lea rdi, [rel best_label]
+    mov ecx, 5
+.count:
+    cmp byte [rdi], 1
+    jne .next_label
+    inc eax
+.next_label:
+    inc rdi
+    loop .count
+    jmp .done
+
+.fallback_zero:
+    xor eax, eax
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; squared_distance_record_scalar — L2 over 14 i16 lanes.
+;   In : rdi = IVF record ptr (14*i16 + label)
+;   Out: rax = u64 squared distance
+; ============================================================
+squared_distance_record_scalar:
+    push rbx
+    xor rax, rax
+    xor ecx, ecx
+    lea rbx, [rel query_i16]
+
+.loop:
+    cmp ecx, DIMS
+    jae .done
+    movsx edx, word [rbx + rcx * 2]
+    movsx esi, word [rdi + rcx * 2]
+    sub edx, esi
+    imul edx, edx
+    movsxd rdx, edx
+    add rax, rdx
+    inc ecx
+    jmp .loop
+
+.done:
+    pop rbx
+    ret
+
+; ============================================================
+; insert_best_u64_asm — insert (dist,label) into sorted top-5 arrays.
+;   In : rdi = dist, sil = label
+; ============================================================
+insert_best_u64_asm:
+    cmp rdi, [rel best_dist + 4 * 8]
+    jae .ret
+
+    lea r8, [rel best_dist]
+    lea r9, [rel best_label]
+    mov ecx, 4
+.shift_loop:
+    test ecx, ecx
+    jz .place
+    mov rax, [r8 + rcx * 8 - 8]
+    cmp rdi, rax
+    jae .place
+    mov [r8 + rcx * 8], rax
+    mov al, [r9 + rcx - 1]
+    mov [r9 + rcx], al
+    dec ecx
+    jmp .shift_loop
+
+.place:
+    mov [r8 + rcx * 8], rdi
+    mov [r9 + rcx], sil
 .ret:
     ret
 
