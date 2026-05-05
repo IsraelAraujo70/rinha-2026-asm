@@ -62,6 +62,7 @@ cluster_best_dist: resq 8
 cluster_best_id: resq 8
 cluster_visited: resb 4096
 dist_lanes: resd 8
+dim_ptrs: resq 14
 txn_ptr: resq 1
 txn_len: resq 1
 customer_ptr: resq 1
@@ -1096,6 +1097,12 @@ knn_count_first_clusters:
     mov rax, [r11 + rbp * 8]      ; selected cluster id
     lea r11, [rel cluster_visited]
     mov byte [r11 + rax], 1
+    cmp qword [rel index_format], 3
+    jne .not_sivf_selected
+    mov rdi, rax
+    call scan_cluster_id
+    jmp .next_cluster
+.not_sivf_selected:
     cmp qword [rel index_format], 2
     je .load_ivf6_offsets
     mov r12, [rbx + rax * 8]      ; start offset (RINHA26 u64)
@@ -1393,6 +1400,8 @@ scan_cluster_id:
     push rbp
 
     mov rbp, rdi
+    cmp qword [rel index_format], 3
+    je .sivf
     mov rbx, [rel cluster_offsets_ptr]
     cmp qword [rel index_format], 2
     je .load_ivf6_offsets
@@ -1448,6 +1457,88 @@ scan_cluster_id:
     add r14, [rel record_stride]
     inc r11
     dec r10
+    jmp .record_loop
+
+.done:
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.sivf:
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    jmp scan_cluster_soa_scalar
+
+%macro ACC_SOA_DIM 1
+    mov rax, [rel dim_ptrs + %1 * 8]
+    movsx ecx, word [rax + r11 * 2]
+    movsx eax, word [rel query_i16 + %1 * 2]
+    sub eax, ecx
+    imul eax, eax
+    cdqe
+    add r8, rax
+    cmp r8, [rel best_dist + 4 * 8]
+    ja .skip_record
+%endmacro
+
+; ============================================================
+; scan_cluster_soa_scalar — SIVF scan with early-exit dimension order.
+;   In : rdi = cluster id
+; ============================================================
+scan_cluster_soa_scalar:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+
+    mov rbp, rdi
+    mov rbx, [rel cluster_offsets_ptr]
+    mov r12d, [rbx + rbp * 4]
+    mov r13d, [rbx + rbp * 4 + 4]
+    cmp r13, r12
+    jbe .done
+
+    mov r11, r12
+.record_loop:
+    cmp r11, r13
+    jae .done
+    xor r8, r8                ; distance accumulator
+
+    ACC_SOA_DIM 5
+    ACC_SOA_DIM 6
+    ACC_SOA_DIM 2
+    ACC_SOA_DIM 0
+    ACC_SOA_DIM 7
+    ACC_SOA_DIM 8
+    ACC_SOA_DIM 11
+    ACC_SOA_DIM 12
+    ACC_SOA_DIM 9
+    ACC_SOA_DIM 10
+    ACC_SOA_DIM 1
+    ACC_SOA_DIM 13
+    ACC_SOA_DIM 3
+    ACC_SOA_DIM 4
+
+    mov rax, [rel labels_ptr]
+    movzx esi, byte [rax + r11]
+    mov rax, [rel ids_ptr]
+    mov edx, [rax + r11 * 4]
+    mov rdi, r8
+    push r11
+    push r13
+    call insert_best_u64_asm
+    pop r13
+    pop r11
+
+.skip_record:
+    inc r11
     jmp .record_loop
 
 .done:
@@ -2583,6 +2674,8 @@ load_index_optional:
     cmp r12, IVF_HEADER_LEN
     jb .return
 
+    cmp dword [r13], 0x46564953    ; "SIVF" (SoA IVF6)
+    je .parse_sivf
     cmp dword [r13], 0x36465649    ; "IVF6"
     je .parse_ivf6
 
@@ -2694,6 +2787,72 @@ load_index_optional:
     mov [rel index_base], r13
     mov [rel index_len], r12
     mov qword [rel index_format], 2
+    mov qword [rel index_loaded], 1
+    jmp .return
+
+.parse_sivf:
+    cmp r12, IVF6_HEADER_LEN
+    jb .return
+    cmp dword [r13 + 12], DIMS
+    jne .return
+    cmp dword [r13 + 16], DIMS
+    jne .return
+
+    mov eax, [r13 + 4]
+    test eax, eax
+    jz .return
+    mov [rel index_count], rax
+    mov eax, [r13 + 8]
+    test eax, eax
+    jz .return
+    mov [rel index_clusters], rax
+
+    lea r14, [r13 + IVF6_HEADER_LEN]
+    mov [rel centroids_ptr], r14
+
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 4
+    add r14, rax
+    mov [rel bbox_min_ptr], r14
+
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 2
+    add r14, rax
+    mov [rel bbox_max_ptr], r14
+
+    mov rax, [rel index_clusters]
+    imul rax, DIMS * 2
+    add r14, rax
+    mov [rel cluster_offsets_ptr], r14
+
+    mov rax, [rel index_clusters]
+    inc rax
+    shl rax, 2
+    add r14, rax
+
+    ; r14 now points to dim0; store 14 dimension base pointers.
+    lea rdi, [rel dim_ptrs]
+    mov rax, [rel index_count]
+    shl rax, 1                ; bytes per dimension array
+    xor ecx, ecx
+.sivf_dim_loop:
+    cmp ecx, DIMS
+    jae .sivf_dims_done
+    mov [rdi + rcx * 8], r14
+    add r14, rax
+    inc ecx
+    jmp .sivf_dim_loop
+.sivf_dims_done:
+    mov [rel labels_ptr], r14
+    mov rax, [rel index_count]
+    add r14, rax
+    mov [rel ids_ptr], r14
+
+    mov qword [rel records_ptr], 0
+    mov qword [rel record_stride], 0
+    mov [rel index_base], r13
+    mov [rel index_len], r12
+    mov qword [rel index_format], 3
     mov qword [rel index_loaded], 1
     jmp .return
 
