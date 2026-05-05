@@ -46,6 +46,8 @@ records_ptr:       dq 0
 labels_ptr:        dq 0
 ids_ptr:           dq 0
 record_stride:     dq 0
+nprobe_limit:      dq 3       ; fast path probes; env IVF_NPROBE overrides
+repair_limit:      dq 2       ; extra selected clusters on borderline; env IVF_REPAIR_LIMIT overrides
 
 section .bss
 ; Per-connection scratch. 16 KiB covers the largest payload we'll see (the
@@ -92,6 +94,10 @@ cl_pattern:    db "content-length:"
 cl_pattern_len equ $ - cl_pattern
 socket_path_prefix: db 'SOCKET_PATH='
 socket_path_prefix_len equ $ - socket_path_prefix
+ivf_nprobe_prefix: db 'IVF_NPROBE='
+ivf_nprobe_prefix_len equ $ - ivf_nprobe_prefix
+ivf_repair_limit_prefix: db 'IVF_REPAIR_LIMIT='
+ivf_repair_limit_prefix_len equ $ - ivf_repair_limit_prefix
 tx_count_key:  db '"tx_count_24h"'
 tx_count_key_len equ $ - tx_count_key
 amount_key:    db '"amount"'
@@ -286,7 +292,7 @@ _start:
     syscall
 
 ; ============================================================
-; load_socket_path_from_env — parse initial stack envp for SOCKET_PATH.
+; load_socket_path_from_env — parse initial stack envp for runtime knobs.
 ;   In : rdi = initial rsp from _start
 ; ============================================================
 load_socket_path_from_env:
@@ -302,13 +308,31 @@ load_socket_path_from_env:
     mov r12, [rbx]
     test r12, r12
     jz .done
+
     mov rdi, r12
     lea rsi, [rel socket_path_prefix]
     mov rcx, socket_path_prefix_len
     call mem_prefix_eq
     test rax, rax
-    jz .next
+    jnz .socket_path
 
+    mov rdi, r12
+    lea rsi, [rel ivf_nprobe_prefix]
+    mov rcx, ivf_nprobe_prefix_len
+    call mem_prefix_eq
+    test rax, rax
+    jnz .ivf_nprobe
+
+    mov rdi, r12
+    lea rsi, [rel ivf_repair_limit_prefix]
+    mov rcx, ivf_repair_limit_prefix_len
+    call mem_prefix_eq
+    test rax, rax
+    jnz .ivf_repair_limit
+
+    jmp .next
+
+.socket_path:
     lea r13, [r12 + socket_path_prefix_len]
     cmp byte [r13], 0
     je .next
@@ -316,7 +340,29 @@ load_socket_path_from_env:
     mov rdi, r13
     call strlen_asm
     mov [rel socket_path_len], rax
-    jmp .done
+    jmp .next
+
+.ivf_nprobe:
+    lea rdi, [r12 + ivf_nprobe_prefix_len]
+    call parse_uint_zstr
+    test rax, rax
+    jz .next
+    cmp rax, 8
+    jbe .nprobe_ok
+    mov eax, 8
+.nprobe_ok:
+    mov [rel nprobe_limit], rax
+    jmp .next
+
+.ivf_repair_limit:
+    lea rdi, [r12 + ivf_repair_limit_prefix_len]
+    call parse_uint_zstr
+    cmp rax, 8
+    jbe .repair_ok
+    mov eax, 8
+.repair_ok:
+    mov [rel repair_limit], rax
+    jmp .next
 
 .next:
     add rbx, 8
@@ -353,6 +399,22 @@ strlen_asm:
     cmp byte [rdi + rax], 0
     je .ret
     inc rax
+    jmp .loop
+.ret:
+    ret
+
+; In: rdi=NUL-terminated decimal string. Out: rax=value, stops at first
+; non-digit so Docker env values like "3" and "3 " both work.
+parse_uint_zstr:
+    xor rax, rax
+.loop:
+    movzx ecx, byte [rdi]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .ret
+    imul rax, rax, 10
+    add rax, rcx
+    inc rdi
     jmp .loop
 .ret:
     ret
@@ -432,10 +494,10 @@ serve_one_request:
     mov eax, SYS_write
     mov rdi, r13
     syscall
-    ; If write fails the next read will return EOF/EPIPE and we'll close
-    ; cleanly anyway; not worth a separate branch here.
-
-    xor rax, rax
+    ; Synchronous server: close after each response so HAProxy cannot pin the
+    ; process on one idle keep-alive fd. UDS reconnect is cheap and this keeps
+    ; the accept loop available for the next queued request.
+    mov rax, -1
     pop r15
     pop r14
     pop rbx
@@ -1084,10 +1146,19 @@ knn_count_first_clusters:
 
     xor ebp, ebp              ; cluster_id
     mov r15, [rel index_clusters]
-    cmp r15, 3
+    mov rax, [rel nprobe_limit]
+    test rax, rax
+    jnz .have_nprobe
+    mov eax, 1
+.have_nprobe:
+    cmp r15, rax
     jbe .probe_limit_ok
-    mov r15d, 3
+    mov r15, rax
 .probe_limit_ok:
+    cmp r15, 8
+    jbe .probe_cap_ok
+    mov r15d, 8
+.probe_cap_ok:
     test r15, r15
     jz .fallback_zero
 
@@ -1172,23 +1243,19 @@ knn_count_first_clusters:
     jmp .cluster_loop
 
 .repair:
-    ; The scalar repair is exact but currently too slow under the official
-    ; 900 rps k6 ramp, causing HTTP timeouts. Keep the implementation below for
-    ; the optimized path, but default to the fast probe-only scan until repair
-    ; gets an AVX2/queue-aware version.
-    ; call bbox_repair_clusters
+    ; Exact all-cluster bbox repair fixes detection but blows up p99 under k6.
+    ; Competitive default: only repair borderline decisions (2/3 frauds) by
+    ; scanning a tiny cap of the next centroid-ranked clusters.
+    call fraud_count_asm
+    cmp eax, 2
+    je .do_selected_repair
+    cmp eax, 3
+    jne .score
+.do_selected_repair:
+    call bbox_repair_selected_clusters
 
 .score:
-    xor eax, eax
-    lea rdi, [rel best_label]
-    mov ecx, 5
-.count:
-    cmp byte [rdi], 1
-    jne .next_label
-    inc eax
-.next_label:
-    inc rdi
-    loop .count
+    call fraud_count_asm
     jmp .done
 
 .fallback_zero:
@@ -1302,6 +1369,85 @@ insert_best_u64_asm:
     mov [r9 + rcx], sil
     mov [r11 + rcx * 4], r10d
 .ret:
+    ret
+
+; ============================================================
+; fraud_count_asm — count fraudulent labels in current top-5.
+;   Out: eax = count 0..5
+; ============================================================
+fraud_count_asm:
+    xor eax, eax
+    lea rdi, [rel best_label]
+    mov ecx, 5
+.loop:
+    cmp byte [rdi], 1
+    jne .next
+    inc eax
+.next:
+    inc rdi
+    loop .loop
+    ret
+
+; ============================================================
+; bbox_repair_selected_clusters — capped adaptive repair.
+; Scan only the next centroid-ranked clusters selected by select_top8_clusters,
+; and only when their bbox can still improve the current top-5 worst distance.
+; This keeps the detection boost of repair without the all-cluster p99 cliff.
+; ============================================================
+bbox_repair_selected_clusters:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, [rel repair_limit]    ; remaining extra clusters to scan
+    test r12, r12
+    jz .done
+
+    mov r14, [rel nprobe_limit]    ; start after fast probes
+    cmp r14, 8
+    jae .done
+
+    mov r15, [rel index_clusters]  ; end = min(clusters, 8)
+    cmp r15, 8
+    jbe .loop
+    mov r15d, 8
+
+.loop:
+    test r12, r12
+    jz .done
+    cmp r14, r15
+    jae .done
+
+    lea rbx, [rel cluster_best_id]
+    mov r13, [rbx + r14 * 8]
+
+    lea rbx, [rel cluster_visited]
+    cmp byte [rbx + r13], 0
+    jne .next
+
+    mov rdi, r13
+    call bbox_lower_bound_asm
+    cmp rax, [rel best_dist + 4 * 8]
+    ja .next
+
+    lea rbx, [rel cluster_visited]
+    mov byte [rbx + r13], 1
+    mov rdi, r13
+    call scan_cluster_id
+    dec r12
+
+.next:
+    inc r14
+    jmp .loop
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ============================================================

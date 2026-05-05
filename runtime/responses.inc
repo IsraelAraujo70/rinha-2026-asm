@@ -12,7 +12,7 @@ resp0:
     db "HTTP/1.1 200 OK", 13, 10
     db "Content-Type: application/json", 13, 10
     db "Content-Length: 35", 13, 10
-    db "Connection: keep-alive", 13, 10
+    db "Connection: close", 13, 10
     db 13, 10
     db '{"approved":true,"fraud_score":0.0}'
 resp0_end:
@@ -21,7 +21,7 @@ resp1:
     db "HTTP/1.1 200 OK", 13, 10
     db "Content-Type: application/json", 13, 10
     db "Content-Length: 35", 13, 10
-    db "Connection: keep-alive", 13, 10
+    db "Connection: close", 13, 10
     db 13, 10
     db '{"approved":true,"fraud_score":0.2}'
 resp1_end:
@@ -30,7 +30,7 @@ resp2:
     db "HTTP/1.1 200 OK", 13, 10
     db "Content-Type: application/json", 13, 10
     db "Content-Length: 35", 13, 10
-    db "Connection: keep-alive", 13, 10
+    db "Connection: close", 13, 10
     db 13, 10
     db '{"approved":true,"fraud_score":0.4}'
 resp2_end:
@@ -39,7 +39,7 @@ resp3:
     db "HTTP/1.1 200 OK", 13, 10
     db "Content-Type: application/json", 13, 10
     db "Content-Length: 36", 13, 10
-    db "Connection: keep-alive", 13, 10
+    db "Connection: close", 13, 10
     db 13, 10
     db '{"approved":false,"fraud_score":0.6}'
 resp3_end:
@@ -48,7 +48,7 @@ resp4:
     db "HTTP/1.1 200 OK", 13, 10
     db "Content-Type: application/json", 13, 10
     db "Content-Length: 36", 13, 10
-    db "Connection: keep-alive", 13, 10
+    db "Connection: close", 13, 10
     db 13, 10
     db '{"approved":false,"fraud_score":0.8}'
 resp4_end:
@@ -57,7 +57,7 @@ resp5:
     db "HTTP/1.1 200 OK", 13, 10
     db "Content-Type: application/json", 13, 10
     db "Content-Length: 36", 13, 10
-    db "Connection: keep-alive", 13, 10
+    db "Connection: close", 13, 10
     db 13, 10
     db '{"approved":false,"fraud_score":1.0}'
 resp5_end:
@@ -75,7 +75,7 @@ resp_table:
 ; 204 for /ready
 ready_resp:
     db "HTTP/1.1 204 No Content", 13, 10
-    db "Connection: keep-alive", 13, 10
+    db "Connection: close", 13, 10
     db "Content-Length: 0", 13, 10
     db 13, 10
 ready_resp_end:

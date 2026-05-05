@@ -24,6 +24,8 @@ services:
     build: .
     environment:
       SOCKET_PATH: /sockets/api1.sock
+      IVF_NPROBE: "5"
+      IVF_REPAIR_LIMIT: "1"
     volumes:
       - sockets:/sockets
     deploy:
@@ -38,6 +40,8 @@ services:
     build: .
     environment:
       SOCKET_PATH: /sockets/api2.sock
+      IVF_NPROBE: "5"
+      IVF_REPAIR_LIMIT: "1"
     volumes:
       - sockets:/sockets
     deploy:
