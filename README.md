@@ -4,16 +4,18 @@ Experimento alternativo da [Rinha de Backend 2026](https://github.com/zanfrances
 
 A submissão "principal" em Rust vive na branch `refactor/secret-sauce` do mesmo repo (final 5135.33 oficial Mac Mini, 19º BR). Esta branch é um experimento paralelo pra ver até onde dá pra ir só com asm.
 
-## Estado atual (Wave 0 — scaffold)
+## Estado atual (Wave 3 — partial vectorization)
 
 - ✅ ELF estático freestanding (`build/api`), linkado direto pelo `ld`
 - ✅ Servidor TCP em `0.0.0.0:8080` via syscalls Linux cruas
-- ✅ Loop `accept` síncrono respondendo sempre `{"approved":true,"fraud_score":0.0}`
+- ✅ Loop `accept` síncrono com HTTP/1.1 keep-alive
+- ✅ Parser HTTP básico (`Content-Length`, body offset, `/ready`, `/fraud-score`)
+- ✅ Parser JSON parcial por busca de chaves reais
+- ✅ Vectorização i16 parcial em `query_i16` (amount, installments, tx_count_24h, is_online, card_present)
+- ✅ Score temporário por heurística desses campos até o KNN entrar
 - ✅ Docker multi-stage com imagem final `FROM scratch`
 - ✅ docker-compose com nginx + 2 réplicas, mesma topologia da versão Rust
-- ⏳ HTTP/1.1 parser (Content-Length, body offset)
-- ⏳ JSON parser do payload `FraudRequest`
-- ⏳ Vectorize + quantize i16 (14 dims)
+- ⏳ Vectorize completo + datas ISO-8601 + `known_merchants`/MCC/last_transaction
 - ⏳ Loader do índice IVF v3 (mmap, parse header)
 - ⏳ Centroid scan + IVF k-NN com AVX2 `vpmaddwd`
 - ⏳ Adaptive nprobe (8 → 24 borderline) + early-exit

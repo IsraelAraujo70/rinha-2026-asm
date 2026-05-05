@@ -33,6 +33,9 @@ section .bss
 ; Per-connection scratch. 16 KiB covers the largest payload we'll see (the
 ; Rinha references include ~500-byte JSON blobs; headers add ~200 bytes).
 recv_buf:  resb 16384
+; Wave 3 quantized vector scratch: 16 i16 lanes so AVX2 can load one full ymm.
+; Lanes 0..13 mirror the Rinha feature contract; lanes 14..15 stay zero.
+query_i16: resw 16
 
 %include "responses.inc"
 
@@ -46,6 +49,14 @@ cl_pattern:    db "content-length:"
 cl_pattern_len equ $ - cl_pattern
 tx_count_key:  db '"tx_count_24h"'
 tx_count_key_len equ $ - tx_count_key
+amount_key:    db '"amount"'
+amount_key_len equ $ - amount_key
+installments_key: db '"installments"'
+installments_key_len equ $ - installments_key
+is_online_key: db '"is_online"'
+is_online_key_len equ $ - is_online_key
+card_present_key: db '"card_present"'
+card_present_key_len equ $ - card_present_key
 
 section .text
 
@@ -391,9 +402,8 @@ parse_content_length:
 ;   In : rdi = body pointer, rsi = body length
 ;   Out: rax = count in 0..5
 ;
-; This is deliberately a narrow, testable parser slice: it extracts the real
-; `customer.tx_count_24h` field and maps it to one of the six response slots.
-; Wave 3 expands this into the full 14-dimensional vectorization contract.
+; Wave 3 fills a partial quantized vector from real payload fields and returns
+; a temporary score bucket from those lanes. KNN will consume query_i16 later.
 ; ============================================================
 parse_score_count_from_json:
     push rbx
@@ -402,24 +412,8 @@ parse_score_count_from_json:
     mov rbx, rdi              ; body base
     mov r12, rsi              ; body length
 
-    lea rdx, [rel tx_count_key]
-    mov rcx, tx_count_key_len
-    call find_bytes
-    test rax, rax
-    js .fallback_zero
-
-    ; rax = offset of key. Move to byte after key and scan for ':'.
-    add rax, tx_count_key_len
-    mov rdi, rbx
-    add rdi, rax              ; current ptr
-    mov rsi, r12
-    sub rsi, rax              ; remaining len
-    call parse_u64_after_colon
-
-    ; Clamp parsed integer into response count range 0..5.
-    cmp rax, 5
-    jbe .done
-    mov eax, 5
+    call vectorize_json_partial
+    call heuristic_count_from_vector
     jmp .done
 
 .fallback_zero:
@@ -428,6 +422,131 @@ parse_score_count_from_json:
 .done:
     pop r12
     pop rbx
+    ret
+
+; ============================================================
+; vectorize_json_partial — fill cheap lanes of query_i16 from JSON.
+;   In : rbx = body base, r12 = body length
+;   Out: query_i16 lanes updated
+;
+; Implemented lanes:
+;   0 amount:       round-ish amount clamped to 0..10000
+;   1 installments: installments / 12 * 10000
+;   8 tx_count_24h: tx_count / 20 * 10000
+;   9 is_online:    0 or 10000
+;  10 card_present: 0 or 10000
+;
+; Missing lanes stay conservative zero for now. last_transaction sentinel
+; lanes 5/6 use -10000 to match the Rust negative quantization contract.
+; ============================================================
+vectorize_json_partial:
+    ; Clear all 16 lanes.
+    lea rdi, [rel query_i16]
+    xor eax, eax
+    mov ecx, 8
+.clear:
+    mov [rdi], rax
+    add rdi, 8
+    loop .clear
+
+    mov word [rel query_i16 + 5 * 2], -10000
+    mov word [rel query_i16 + 6 * 2], -10000
+
+    ; amount -> lane 0. quant_i16(clamp(amount/10000)) == round(amount).
+    lea rdx, [rel amount_key]
+    mov rcx, amount_key_len
+    call find_key_number
+    cmp rax, 10000
+    jbe .amount_ok
+    mov eax, 10000
+.amount_ok:
+    mov [rel query_i16 + 0 * 2], ax
+
+    ; installments -> lane 1 = clamp(installments / 12) * 10000.
+    lea rdx, [rel installments_key]
+    mov rcx, installments_key_len
+    call find_key_number
+    cmp rax, 12
+    jbe .installments_ok
+    mov eax, 12
+.installments_ok:
+    imul rax, rax, 10000
+    xor edx, edx
+    mov ecx, 12
+    div rcx
+    mov [rel query_i16 + 1 * 2], ax
+
+    lea rdx, [rel tx_count_key]
+    mov rcx, tx_count_key_len
+    call find_key_number
+    cmp rax, 20
+    jbe .tx_ok
+    mov eax, 20
+.tx_ok:
+    imul rax, rax, 10000
+    xor edx, edx
+    mov ecx, 20
+    div rcx
+    mov [rel query_i16 + 8 * 2], ax
+
+    lea rdx, [rel is_online_key]
+    mov rcx, is_online_key_len
+    call find_key_bool
+    test rax, rax
+    jz .online_done
+    mov word [rel query_i16 + 9 * 2], 10000
+.online_done:
+
+    lea rdx, [rel card_present_key]
+    mov rcx, card_present_key_len
+    call find_key_bool
+    test rax, rax
+    jz .card_done
+    mov word [rel query_i16 + 10 * 2], 10000
+.card_done:
+    ret
+
+; ============================================================
+; heuristic_count_from_vector — temporary bucket until IVF KNN is wired.
+;   Out: rax = 0..5
+; ============================================================
+heuristic_count_from_vector:
+    xor eax, eax
+
+    ; amount contribution: +0..3 by amount lane.
+    movsx ecx, word [rel query_i16 + 0 * 2]
+    cmp ecx, 2000
+    jb .amount_done
+    inc eax
+    cmp ecx, 5000
+    jb .amount_done
+    inc eax
+    cmp ecx, 8000
+    jb .amount_done
+    inc eax
+.amount_done:
+
+    ; high 24h activity.
+    movsx ecx, word [rel query_i16 + 8 * 2]
+    cmp ecx, 2500             ; tx_count_24h >= 5
+    jb .tx_done
+    inc eax
+.tx_done:
+
+    ; online and card-not-present are riskier for this temporary heuristic.
+    cmp word [rel query_i16 + 9 * 2], 10000
+    jne .online_done
+    inc eax
+.online_done:
+    cmp word [rel query_i16 + 10 * 2], 10000
+    je .clamp
+    inc eax
+
+.clamp:
+    cmp eax, 5
+    jbe .ret
+    mov eax, 5
+.ret:
     ret
 
 ; ============================================================
@@ -495,6 +614,60 @@ find_bytes:
     ret
 
 ; ============================================================
+; find_key_number — find a JSON key and parse the unsigned number after ':'.
+;   In : rbx = body ptr, r12 = body len, rdx = key ptr, rcx = key len
+;   Out: rax = integer part of the number, or 0 if absent/malformed
+; ============================================================
+find_key_number:
+    push rdx
+    push rcx
+    mov rdi, rbx
+    mov rsi, r12
+    call find_bytes
+    pop rcx
+    pop rdx
+    test rax, rax
+    js .zero
+
+    add rax, rcx
+    mov rdi, rbx
+    add rdi, rax
+    mov rsi, r12
+    sub rsi, rax
+    call parse_u64_after_colon
+    ret
+.zero:
+    xor eax, eax
+    ret
+
+; ============================================================
+; find_key_bool — find a JSON key and parse true/false after ':'.
+;   In : rbx = body ptr, r12 = body len, rdx = key ptr, rcx = key len
+;   Out: rax = 1 for true, 0 for false/absent/malformed
+; ============================================================
+find_key_bool:
+    push rdx
+    push rcx
+    mov rdi, rbx
+    mov rsi, r12
+    call find_bytes
+    pop rcx
+    pop rdx
+    test rax, rax
+    js .false
+
+    add rax, rcx
+    mov rdi, rbx
+    add rdi, rax
+    mov rsi, r12
+    sub rsi, rax
+    call parse_bool_after_colon
+    ret
+.false:
+    xor eax, eax
+    ret
+
+; ============================================================
 ; parse_u64_after_colon — scan a short JSON suffix for ':' and parse uint.
 ;   In : rdi = ptr after key, rsi = remaining length
 ;   Out: rax = parsed integer, or 0 if missing/malformed
@@ -550,5 +723,61 @@ parse_u64_after_colon:
     ret
 
 .zero:
+    xor eax, eax
+    ret
+
+; ============================================================
+; parse_bool_after_colon — scan a JSON suffix for ':' and parse true/false.
+;   In : rdi = ptr after key, rsi = remaining length
+;   Out: rax = 1 for true, 0 otherwise
+; ============================================================
+parse_bool_after_colon:
+    xor r8, r8
+
+.find_colon:
+    cmp r8, rsi
+    jae .false
+    cmp byte [rdi + r8], ':'
+    je .after_colon
+    inc r8
+    jmp .find_colon
+
+.after_colon:
+    inc r8
+
+.skip_ws:
+    cmp r8, rsi
+    jae .false
+    mov al, [rdi + r8]
+    cmp al, ' '
+    je .skip_one
+    cmp al, 9
+    je .skip_one
+    cmp al, 10
+    je .skip_one
+    cmp al, 13
+    je .skip_one
+    jmp .parse
+.skip_one:
+    inc r8
+    jmp .skip_ws
+
+.parse:
+    ; Need at least "true".
+    mov rax, rsi
+    sub rax, r8
+    cmp rax, 4
+    jb .false
+    cmp byte [rdi + r8], 't'
+    jne .false
+    cmp byte [rdi + r8 + 1], 'r'
+    jne .false
+    cmp byte [rdi + r8 + 2], 'u'
+    jne .false
+    cmp byte [rdi + r8 + 3], 'e'
+    jne .false
+    mov eax, 1
+    ret
+.false:
     xor eax, eax
     ret
