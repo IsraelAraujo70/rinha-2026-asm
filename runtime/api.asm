@@ -30,6 +30,8 @@ SOCKADDR_LEN equ $ - sockaddr_in
 one_int: dd 1
 
 section .data
+socket_path_ptr: dq 0
+socket_path_len: dq 0
 index_loaded:      dq 0
 index_format:      dq 0       ; 1=RINHA26 AoS32, 2=IVF6 AoS28+labels
 index_base:        dq 0
@@ -49,6 +51,7 @@ section .bss
 ; Per-connection scratch. 16 KiB covers the largest payload we'll see (the
 ; Rinha references include ~500-byte JSON blobs; headers add ~200 bytes).
 recv_buf:  resb 16384
+sockaddr_un_buf: resb 110   ; sa_family_t + sun_path[108]
 ; Wave 3 quantized vector scratch: 16 i16 lanes so AVX2 can load one full ymm.
 ; Lanes 0..13 mirror the Rinha feature contract; lanes 14..15 stay zero.
 query_i16: resw 16
@@ -84,6 +87,8 @@ fs_path:       db '/fraud-score '
 fs_path_len    equ $ - fs_path
 cl_pattern:    db "content-length:"
 cl_pattern_len equ $ - cl_pattern
+socket_path_prefix: db 'SOCKET_PATH='
+socket_path_prefix_len equ $ - socket_path_prefix
 tx_count_key:  db '"tx_count_24h"'
 tx_count_key_len equ $ - tx_count_key
 amount_key:    db '"amount"'
@@ -143,8 +148,14 @@ section .text
 ; _start — setup listener, then accept-serve loop forever.
 ; ============================================================
 _start:
+    mov rdi, rsp
+    call load_socket_path_from_env
     call load_index_optional
 
+    cmp qword [rel socket_path_ptr], 0
+    jne .setup_unix_socket
+
+.setup_tcp_socket:
     mov eax, SYS_socket
     mov edi, AF_INET
     mov esi, SOCK_STREAM
@@ -169,6 +180,72 @@ _start:
     syscall
     test rax, rax
     js .die
+
+    mov eax, SYS_listen
+    mov rdi, r12
+    mov esi, 4096
+    syscall
+    test rax, rax
+    js .die
+    jmp .accept_loop
+
+.setup_unix_socket:
+    mov eax, SYS_socket
+    mov edi, AF_UNIX
+    mov esi, SOCK_STREAM
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .die
+    mov r12, rax
+
+    ; Best-effort unlink of stale socket path.
+    mov eax, SYS_unlink
+    mov rdi, [rel socket_path_ptr]
+    syscall
+
+    lea rdi, [rel sockaddr_un_buf]
+    xor eax, eax
+    mov ecx, 110
+.clear_un:
+    mov byte [rdi], 0
+    inc rdi
+    loop .clear_un
+
+    lea rdi, [rel sockaddr_un_buf]
+    mov word [rdi], AF_UNIX
+    mov rsi, [rel socket_path_ptr]
+    mov rcx, [rel socket_path_len]
+    cmp rcx, 107
+    jbe .path_len_ok
+    mov ecx, 107
+.path_len_ok:
+    mov [rel socket_path_len], rcx
+    lea rdi, [rel sockaddr_un_buf + 2]
+.copy_path:
+    test rcx, rcx
+    jz .path_copied
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp .copy_path
+.path_copied:
+
+    mov eax, SYS_bind
+    mov rdi, r12
+    lea rsi, [rel sockaddr_un_buf]
+    mov rdx, [rel socket_path_len]
+    add rdx, 3                ; family(2) + path bytes + trailing NUL
+    syscall
+    test rax, rax
+    js .die
+
+    mov eax, SYS_chmod
+    mov rdi, [rel socket_path_ptr]
+    mov esi, 438              ; 0666 octal
+    syscall
 
     mov eax, SYS_listen
     mov rdi, r12
@@ -204,6 +281,78 @@ _start:
     mov eax, SYS_exit_group
     mov edi, 1
     syscall
+
+; ============================================================
+; load_socket_path_from_env — parse initial stack envp for SOCKET_PATH.
+;   In : rdi = initial rsp from _start
+; ============================================================
+load_socket_path_from_env:
+    push rbx
+    push r12
+    push r13
+
+    mov rbx, rdi
+    mov rax, [rbx]            ; argc
+    lea rbx, [rbx + 8 + rax * 8 + 8] ; envp = &argv[argc + 1]
+
+.env_loop:
+    mov r12, [rbx]
+    test r12, r12
+    jz .done
+    mov rdi, r12
+    lea rsi, [rel socket_path_prefix]
+    mov rcx, socket_path_prefix_len
+    call mem_prefix_eq
+    test rax, rax
+    jz .next
+
+    lea r13, [r12 + socket_path_prefix_len]
+    cmp byte [r13], 0
+    je .next
+    mov [rel socket_path_ptr], r13
+    mov rdi, r13
+    call strlen_asm
+    mov [rel socket_path_len], rax
+    jmp .done
+
+.next:
+    add rbx, 8
+    jmp .env_loop
+
+.done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; In: rdi=string, rsi=prefix, rcx=len. Out: rax=1 if equal.
+mem_prefix_eq:
+    test rcx, rcx
+    jz .yes
+.loop:
+    mov al, [rdi]
+    cmp al, [rsi]
+    jne .no
+    inc rdi
+    inc rsi
+    dec rcx
+    jnz .loop
+.yes:
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+strlen_asm:
+    xor rax, rax
+.loop:
+    cmp byte [rdi + rax], 0
+    je .ret
+    inc rax
+    jmp .loop
+.ret:
+    ret
 
 ; ============================================================
 ; serve_one_request — read+parse one HTTP request and write the response.

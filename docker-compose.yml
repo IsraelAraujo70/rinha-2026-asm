@@ -1,11 +1,12 @@
 services:
-  nginx:
-    image: nginx:1.27-alpine
+  haproxy:
+    image: haproxy:3.3-alpine
     platform: linux/amd64
     ports:
       - "9999:9999"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sockets:/sockets
     depends_on:
       api1:
         condition: service_started
@@ -15,12 +16,16 @@ services:
       resources:
         limits:
           cpus: "0.20"
-          memory: "20MB"
+          memory: "50MB"
 
   api1:
     image: rinha-2026-asm:latest
     platform: linux/amd64
     build: .
+    environment:
+      SOCKET_PATH: /sockets/api1.sock
+    volumes:
+      - sockets:/sockets
     deploy:
       resources:
         limits:
@@ -31,8 +36,15 @@ services:
     image: rinha-2026-asm:latest
     platform: linux/amd64
     build: .
+    environment:
+      SOCKET_PATH: /sockets/api2.sock
+    volumes:
+      - sockets:/sockets
     deploy:
       resources:
         limits:
           cpus: "0.40"
           memory: "160MB"
+
+volumes:
+  sockets:

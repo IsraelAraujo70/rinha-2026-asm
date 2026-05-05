@@ -17,6 +17,8 @@
 %define SYS_bind          49
 %define SYS_listen        50
 %define SYS_setsockopt    54
+%define SYS_unlink        87
+%define SYS_chmod         90
 %define SYS_exit         60
 %define SYS_exit_group   231
 %define SYS_epoll_wait   232
@@ -26,6 +28,7 @@
 
 ; ---- Socket constants ----
 %define AF_INET            2
+%define AF_UNIX            1
 %define SOCK_STREAM        1
 %define SOL_SOCKET         1
 %define SO_REUSEADDR       2
