@@ -50,6 +50,8 @@ recv_buf:  resb 16384
 query_i16: resw 16
 best_dist: resq 5
 best_label: resb 5
+cluster_best_dist: resq 8
+cluster_best_id: resq 8
 
 %include "responses.inc"
 
@@ -73,6 +75,7 @@ card_present_key: db '"card_present"'
 card_present_key_len equ $ - card_present_key
 index_path: db '/index/data.bin', 0
 index_magic: db 'RINHA26', 0
+f32_10000: dd 10000.0
 
 IVF_HEADER_LEN equ 32
 IVF_VERSION equ 3
@@ -579,11 +582,11 @@ heuristic_count_from_vector:
     ret
 
 ; ============================================================
-; knn_count_first_clusters — scan the first up-to-8 IVF clusters.
+; knn_count_first_clusters — scan the 8 closest IVF clusters.
 ;   Out: rax = number of fraud labels among the 5 nearest records in cluster 0
 ;
-; This is Wave 6's multi-cluster scan slice. It still uses a fixed probe list
-; (clusters 0..7) rather than centroid-selected probes; Wave 7 sorts centroids.
+; Wave 7 selects probes by scalar centroid distance. The name remains for now
+; to avoid a large churny rename in the route path.
 ; ============================================================
 knn_count_first_clusters:
     push rbx
@@ -614,6 +617,8 @@ knn_count_first_clusters:
     test rbx, rbx
     jz .fallback_zero
 
+    call select_top8_clusters
+
     xor ebp, ebp              ; cluster_id
     mov r15, [rel index_clusters]
     cmp r15, 8
@@ -627,8 +632,10 @@ knn_count_first_clusters:
     cmp rbp, r15
     jae .score
 
-    mov r12, [rbx + rbp * 8]      ; start offset
-    mov r13, [rbx + rbp * 8 + 8]  ; end offset
+    lea r11, [rel cluster_best_id]
+    mov rax, [r11 + rbp * 8]      ; selected cluster id
+    mov r12, [rbx + rax * 8]      ; start offset
+    mov r13, [rbx + rax * 8 + 8]  ; end offset
     cmp r13, r12
     jbe .next_cluster
 
@@ -740,6 +747,123 @@ insert_best_u64_asm:
 .place:
     mov [r8 + rcx * 8], rdi
     mov [r9 + rcx], sil
+.ret:
+    ret
+
+; ============================================================
+; select_top8_clusters — choose closest centroid ids into cluster_best_id.
+;   Uses scalar SSE to convert centroid f32 lanes to i16 scale on the fly.
+; ============================================================
+select_top8_clusters:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    lea rdi, [rel cluster_best_dist]
+    mov rax, -1
+    mov ecx, 8
+.init_dist:
+    mov [rdi], rax
+    add rdi, 8
+    loop .init_dist
+
+    lea rdi, [rel cluster_best_id]
+    xor eax, eax
+    mov ecx, 8
+.init_id:
+    mov [rdi], rax
+    add rdi, 8
+    loop .init_id
+
+    mov r12, [rel index_clusters]
+    xor r13, r13              ; cluster id
+
+.loop:
+    cmp r13, r12
+    jae .done
+    mov rdi, r13
+    call centroid_distance_scalar
+    mov rdi, rax              ; distance
+    mov rsi, r13              ; cluster id
+    call insert_best_cluster_asm
+    inc r13
+    jmp .loop
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; centroid_distance_scalar — integer distance to centroid[cluster_id].
+;   In : rdi = cluster_id
+;   Out: rax = u64 squared distance in i16 scale
+; ============================================================
+centroid_distance_scalar:
+    push rbx
+    push r12
+
+    mov rbx, [rel centroids_ptr]
+    mov rax, rdi
+    imul rax, DIMS * 4
+    add rbx, rax              ; centroid ptr
+
+    lea r12, [rel query_i16]
+    xor rax, rax
+    xor ecx, ecx
+
+.loop:
+    cmp ecx, DIMS
+    jae .done
+
+    movss xmm0, dword [rbx + rcx * 4]
+    mulss xmm0, dword [rel f32_10000]
+    cvttss2si edx, xmm0       ; centroid lane scaled to i16-ish integer
+    movsx esi, word [r12 + rcx * 2]
+    sub esi, edx
+    imul esi, esi
+    movsxd rsi, esi
+    add rax, rsi
+
+    inc ecx
+    jmp .loop
+
+.done:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================
+; insert_best_cluster_asm — sorted top-8 insert for (dist, cluster_id).
+;   In : rdi = distance, rsi = cluster id
+; ============================================================
+insert_best_cluster_asm:
+    cmp rdi, [rel cluster_best_dist + 7 * 8]
+    jae .ret
+
+    lea r8, [rel cluster_best_dist]
+    lea r9, [rel cluster_best_id]
+    mov ecx, 7
+.shift_loop:
+    test ecx, ecx
+    jz .place
+    mov rax, [r8 + rcx * 8 - 8]
+    cmp rdi, rax
+    jae .place
+    mov [r8 + rcx * 8], rax
+    mov rax, [r9 + rcx * 8 - 8]
+    mov [r9 + rcx * 8], rax
+    dec ecx
+    jmp .shift_loop
+
+.place:
+    mov [r8 + rcx * 8], rdi
+    mov [r9 + rcx * 8], rsi
 .ret:
     ret
 
