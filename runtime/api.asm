@@ -1084,9 +1084,9 @@ knn_count_first_clusters:
 
     xor ebp, ebp              ; cluster_id
     mov r15, [rel index_clusters]
-    cmp r15, 1
+    cmp r15, 3
     jbe .probe_limit_ok
-    mov r15d, 1
+    mov r15d, 3
 .probe_limit_ok:
     test r15, r15
     jz .fallback_zero
