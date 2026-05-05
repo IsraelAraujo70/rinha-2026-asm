@@ -16,7 +16,7 @@ services:
       resources:
         limits:
           cpus: "0.20"
-          memory: "50MB"
+          memory: "30MB"
 
   api1:
     image: ghcr.io/israelaraujo70/rinha-2026-asm:e353f41
