@@ -52,6 +52,7 @@ best_dist: resq 5
 best_label: resb 5
 cluster_best_dist: resq 8
 cluster_best_id: resq 8
+dist_lanes: resd 8
 
 %include "responses.inc"
 
@@ -76,6 +77,9 @@ card_present_key_len equ $ - card_present_key
 index_path: db '/index/data.bin', 0
 index_magic: db 'RINHA26', 0
 f32_10000: dd 10000.0
+distance_mask_i16:
+    times 14 dw -1
+    times 2 dw 0
 
 IVF_HEADER_LEN equ 32
 IVF_VERSION equ 3
@@ -653,7 +657,7 @@ knn_count_first_clusters:
 
     mov rdi, r14
     push r10
-    call squared_distance_record_scalar
+    call squared_distance_record_avx2
     pop r10
     movzx esi, byte [r14 + 28]
     mov rdi, rax
@@ -719,6 +723,37 @@ squared_distance_record_scalar:
 
 .done:
     pop rbx
+    ret
+
+; ============================================================
+; squared_distance_record_avx2 — L2 over 14 i16 lanes via vpmaddwd.
+;   In : rdi = IVF record ptr (14*i16 + label)
+;   Out: rax = u64 squared distance
+;
+; Stores the eight i32 partial sums into dist_lanes, then zero-extends and
+; sums in GPRs. That is intentionally straightforward; a pure register
+; horizontal reduction can replace it once behavior is fully locked down.
+; ============================================================
+squared_distance_record_avx2:
+    vmovdqu ymm0, [rel query_i16]
+    vmovdqu ymm1, [rdi]
+    vpand ymm1, ymm1, [rel distance_mask_i16]
+    vpsubw ymm0, ymm0, ymm1
+    vpmaddwd ymm0, ymm0, ymm0
+    vmovdqu [rel dist_lanes], ymm0
+    vzeroupper
+
+    xor rax, rax
+    xor ecx, ecx
+    lea r8, [rel dist_lanes]
+.sum:
+    cmp ecx, 8
+    jae .done
+    mov edx, [r8 + rcx * 4]
+    add rax, rdx
+    inc ecx
+    jmp .sum
+.done:
     ret
 
 ; ============================================================
