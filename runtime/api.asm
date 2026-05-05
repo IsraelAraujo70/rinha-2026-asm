@@ -1172,7 +1172,11 @@ knn_count_first_clusters:
     jmp .cluster_loop
 
 .repair:
-    call bbox_repair_clusters
+    ; The scalar repair is exact but currently too slow under the official
+    ; 900 rps k6 ramp, causing HTTP timeouts. Keep the implementation below for
+    ; the optimized path, but default to the fast probe-only scan until repair
+    ; gets an AVX2/queue-aware version.
+    ; call bbox_repair_clusters
 
 .score:
     xor eax, eax
